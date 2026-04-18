@@ -10,6 +10,11 @@ Prediction: mu + b_u + b_i + p_u^T q_i
 The corpus log-likelihood and rating loss are jointly optimised so that
 the rating signal informs the topics and the topics regularise the item
 factors.
+
+Tuning matches the structure of LFM.py: a grid search over lr, reg, and
+mu_corpus on the validation set, using the "checkpoint trick" to evaluate
+multiple epoch counts in a single training run. The corpus log-likelihood
+gradient is divided by N_total so that mu_corpus ~ 1 is a neutral default.
 """
 
 import numpy as np
@@ -17,24 +22,23 @@ from gensim import corpora
 
 from data_preprocessing import load_amazon_gz, split_data, clean
 
+
 # ---------------------------------------------------------------------------
-# 1. Build corpus: one document per item (list of word indices)
+# 1. Build corpus: one document per item, stored as flat arrays for speed
 # ---------------------------------------------------------------------------
 def build_corpus(train, sid2idx, n_vocab=5000):
     """
     Group reviews by item, clean, build vocabulary, convert to word indices.
-    Returns doc_words (list of arrays) and dictionary.
+    Returns doc_words (list of arrays, one per item) and the gensim dictionary.
     """
     train = train.copy()
     train['tokens'] = train['reviewText'].apply(clean)
     docs = train.groupby('asin')['tokens'].apply(lambda x: sum(x, [])).reset_index()
     docs.columns = ['asin', 'tokens']
 
-    # Build vocabulary
     dictionary = corpora.Dictionary(docs['tokens'])
     dictionary.filter_extremes(keep_n=n_vocab)
 
-    # Convert to word index arrays per item
     n_items = len(sid2idx)
     doc_words = [np.array([], dtype=np.int32) for _ in range(n_items)]
 
@@ -55,104 +59,101 @@ def build_corpus(train, sid2idx, n_vocab=5000):
 # 2. Softmax (numerically stable)
 # ---------------------------------------------------------------------------
 def softmax(x, axis=-1):
-    """Compute softmax along given axis with numerical stability."""
     x_shifted = x - np.max(x, axis=axis, keepdims=True)
     exp_x = np.exp(x_shifted)
     return exp_x / np.sum(exp_x, axis=axis, keepdims=True)
 
 
 # ---------------------------------------------------------------------------
-# 3. Gibbs sampling: sample topic for each word
+# 3. Flatten doc_words into contiguous arrays for vectorised ops
 # ---------------------------------------------------------------------------
-def gibbs_sample(doc_words, theta, phi, doc_topics, rng):
+def flatten_corpus(doc_words):
     """
-    For each word in each document, sample a topic from:
-        p(z=k) proportional to theta[i,k] * phi[k, w]
-
-    doc_topics is modified in place.
-    Returns corpus log-likelihood.
+    Returns
+    -------
+    all_words : (N_total,) int array of word ids
+    all_docs  : (N_total,) int array of doc ids (parallel to all_words)
+    n_d       : (n_items,) int array of words per document
     """
-    lk = 0.0
-    for i in range(len(doc_words)):
-        words = doc_words[i]
-        if len(words) == 0:
-            continue
-        for j in range(len(words)):
-            w = words[j]
-            probs = theta[i] * phi[:, w]
-            prob_sum = probs.sum()
-            if prob_sum > 0:
-                probs /= prob_sum
-            else:
-                probs = np.ones_like(probs) / len(probs)
-            z = rng.multinomial(1, probs).argmax()
-            doc_topics[i][j] = z
-            lk += np.log(theta[i, z] * phi[z, w] + 1e-30)
-    return lk
+    n_d = np.array([len(d) for d in doc_words], dtype=np.int64)
+    all_words = np.concatenate(doc_words).astype(np.int64) if n_d.sum() > 0 \
+                else np.array([], dtype=np.int64)
+    all_docs = np.repeat(np.arange(len(doc_words), dtype=np.int64), n_d)
+    return all_words, all_docs, n_d
 
 
 # ---------------------------------------------------------------------------
-# 4. Compute corpus gradients
+# 4. Gibbs sampling
 # ---------------------------------------------------------------------------
-def compute_corpus_gradients(doc_words, doc_topics, theta, phi, q, kappa,
-                             n_topics, n_vocab):
+def gibbs_sample_vec(all_words, all_docs, theta, phi, rng):
     """
-    Pre-compute gradients of corpus log-likelihood w.r.t. q, psi, kappa.
+    Sample a topic for every word in the corpus from
+        p(z=k) proportional to theta[i,k] * phi[k, w].
 
-    grad_q[i,k] = kappa * (N_{k,i} - N_i * theta_{i,k})
-    grad_kappa  = sum_d sum_j (q_{d,z_j} - E_theta[q_d])
-    grad_psi[k,w] = sum_d sum_{j: z_j=k} (1[w_j=w] - phi[k,w])
+    Returns
+    -------
+    all_topics : (N_total,) int array of sampled topics
+    lk         : corpus log-likelihood under the sampled assignments
     """
-    n_items = len(doc_words)
-    grad_q = np.zeros_like(q)       # (n_items, n_topics)
-    grad_psi = np.zeros((n_topics, n_vocab))
-    grad_kappa = 0.0
+    # raw[j, k] = theta[all_docs[j], k] * phi[k, all_words[j]]
+    raw = theta[all_docs] * phi.T[all_words]          # (N_total, K)
+    probs = raw / raw.sum(axis=1, keepdims=True)
 
-    # Expected q under theta for each item: sum_k theta[i,k] * q[i,k]
-    eq = np.sum(theta * q, axis=1)  # (n_items,)
+    # Inverse-CDF categorical sampling 
+    cumprobs = probs.cumsum(axis=1)
+    u = rng.uniform(size=(len(all_words), 1))
+    all_topics = (cumprobs < u).sum(axis=1).astype(np.int64)
 
-    for i in range(n_items):
-        words = doc_words[i]
-        topics = doc_topics[i]
-        n_d = len(words)
-        if n_d == 0:
-            continue
+    # Log-likelihood under the sampled assignments
+    lk = np.log(raw[np.arange(len(all_words)), all_topics] + 1e-30).sum()
+    return all_topics, lk
 
-        # Count topics in this document
-        topic_counts = np.bincount(topics, minlength=n_topics).astype(np.float64)
 
-        # grad_q[i,k] = kappa * (N_{k,i} - N_i * theta[i,k])
-        grad_q[i] = kappa * (topic_counts - n_d * theta[i])
+# ---------------------------------------------------------------------------
+# 5. Corpus gradients
+# ---------------------------------------------------------------------------
+def compute_corpus_gradients_vec(all_words, all_docs, all_topics,
+                                 theta, phi, q, kappa,
+                                 n_items, n_topics, n_vocab, n_d):
+    """
+    Analytical gradients of the LDA-LFM corpus log-likelihood:
+        grad_q[i,k]  = kappa * (N_{k,i} - N_i * theta[i,k])
+        grad_psi[k,w] = N_{k,w} - N_k * phi[k,w]
+        grad_kappa   = sum_{i,j} (q[i, z_{i,j}] - E_theta[q_i])
+    """
+    # Document-topic counts: N_{k,i}
+    topic_counts = np.bincount(
+        all_docs * n_topics + all_topics,
+        minlength=n_items * n_topics,
+    ).reshape(n_items, n_topics).astype(np.float64)
 
-        # grad_kappa: sum_j (q[i, z_j] - E_theta[q_i])
-        for j in range(n_d):
-            z = topics[j]
-            grad_kappa += q[i, z] - eq[i]
+    # Topic-word counts: N_{k,w}
+    word_topic_counts = np.bincount(
+        all_topics * n_vocab + all_words,
+        minlength=n_topics * n_vocab,
+    ).reshape(n_topics, n_vocab).astype(np.float64)
 
-        # grad_psi[k,w]: for each word assigned to topic k
-        for j in range(n_d):
-            z = topics[j]
-            w = words[j]
-            grad_psi[z, w] += 1.0  # count
+    # grad_q
+    grad_q = kappa * (topic_counts - n_d[:, None] * theta)
 
-    # Adjust grad_psi: sum (1[w_j=w] - phi[k,w]) for each (k,w)
-    # We accumulated the counts, now subtract the expected
-    for k in range(n_topics):
-        total_k = grad_psi[k].sum()  # total words assigned to topic k
-        grad_psi[k] = grad_psi[k] - total_k * phi[k]
+    # grad_psi
+    N_k = word_topic_counts.sum(axis=1, keepdims=True)   # (n_topics, 1)
+    grad_psi = word_topic_counts - N_k * phi
+
+    # grad_kappa
+    eq = (theta * q).sum(axis=1)                          # E_theta[q_i]
+    grad_kappa = float(q[all_docs, all_topics].sum() - eq[all_docs].sum())
 
     return grad_q, grad_psi, grad_kappa
 
 
 # ---------------------------------------------------------------------------
-# 5. Prediction
+# 6. Prediction and evaluation
 # ---------------------------------------------------------------------------
 def predict_ratings(data, mu, P, Q, b_u, b_i):
-    """Predict ratings for all (user, item) pairs in data."""
     users = data['user_idx'].values
     items = data['item_idx'].values
-    pred = mu + b_u[users] + b_i[items] + np.sum(P[users] * Q[items], axis=1)
-    return pred
+    return mu + b_u[users] + b_i[items] + np.sum(P[users] * Q[items], axis=1)
 
 
 def evaluate(predictions, true_ratings):
@@ -165,102 +166,100 @@ def evaluate(predictions, true_ratings):
 
 
 # ---------------------------------------------------------------------------
-# 6. Main training loop
+# 7. Core fit: single run with checkpointed validation evaluations
 # ---------------------------------------------------------------------------
 def fit_lda_lfm(train, valid, doc_words, uid2idx, sid2idx,
-                n_topics=10, n_vocab=5000, n_epochs=100,
+                n_topics=10, n_vocab=5000,
                 lr=0.005, reg=0.02, mu_corpus=1.0, kappa_init=1.0,
-                beta1=0.9, beta2=0.999, eps=1e-8, patience=5):
+                beta1=0.9, beta2=0.999, eps=1e-8,
+                checkpoint_epochs=(5, 20, 50)):
     """
-    Train LDA-LFM with Adam optimiser and early stopping.
+    Train LDA-LFM with Adam. Runs for max(checkpoint_epochs) epochs and
+    returns a dict mapping each checkpoint epoch to (val_mse, params_copy).
     """
     n_users = len(uid2idx)
     n_items = len(sid2idx)
+    n_epochs = max(checkpoint_epochs)
+    checkpoint_set = set(checkpoint_epochs)
 
     rng = np.random.RandomState(42)
     mu = train['overall'].mean()
 
-    # Initialise model parameters
-    Q = rng.normal(0, 0.01, (n_items, n_topics)).astype(np.float64)
-    P = rng.normal(0, 0.01, (n_users, n_topics)).astype(np.float64)
+    # Parameters
+    Q   = rng.normal(0, 0.01, (n_items, n_topics)).astype(np.float64)
+    P   = rng.normal(0, 0.01, (n_users, n_topics)).astype(np.float64)
     b_u = np.zeros(n_users, dtype=np.float64)
     b_i = np.zeros(n_items, dtype=np.float64)
     psi = rng.normal(0, 0.01, (n_topics, n_vocab)).astype(np.float64)
     kappa = float(kappa_init)
 
-    # Initialise topic assignments randomly
-    doc_topics = [rng.randint(0, n_topics, size=len(doc_words[i]))
-                  for i in range(n_items)]
+    # Flat corpus arrays (built once per fit)
+    all_words, all_docs, n_d = flatten_corpus(doc_words)
+    total_words = int(n_d.sum())
 
-    # Adam state for each parameter
+    # Adam state
     adam = {name: {'m': np.zeros_like(param), 'v': np.zeros_like(param)}
             for name, param in [('Q', Q), ('P', P), ('b_u', b_u),
                                 ('b_i', b_i), ('psi', psi)]}
     adam['kappa'] = {'m': 0.0, 'v': 0.0}
 
-    # Training arrays
+    # Rating arrays
     users = train['user_idx'].values
     items = train['item_idx'].values
     ratings = train['overall'].values.astype(np.float64)
     n_ratings = len(ratings)
 
-    # Early stopping state
-    best_val_mse = np.inf
-    best_epoch = 0
-    best_params = None
-    epochs_no_improve = 0
+    checkpoints = {}
 
     for epoch in range(n_epochs):
 
-        # --- Step 1: Compute theta and phi from current parameters ---
-        theta = softmax(kappa * Q)                     # (n_items, n_topics)
-        phi = softmax(psi)                             # (n_topics, n_vocab)
+        # 1) Compute theta and phi from current parameters
+        theta = softmax(kappa * Q)                         # (n_items, K)
+        phi   = softmax(psi)                               # (K, V)
 
-        # --- Step 2: Gibbs sampling ---
-        lk = gibbs_sample(doc_words, theta, phi, doc_topics, rng)
+        # 2) Vectorised Gibbs sampling
+        all_topics, _lk = gibbs_sample_vec(all_words, all_docs, theta, phi, rng)
 
-        # --- Step 3: Compute corpus gradients ---
+        # 3) Vectorised corpus gradients
         grad_q_corpus, grad_psi_corpus, grad_kappa_corpus = \
-            compute_corpus_gradients(doc_words, doc_topics, theta, phi, Q,
-                                     kappa, n_topics, n_vocab)
+            compute_corpus_gradients_vec(all_words, all_docs, all_topics,
+                                         theta, phi, Q, kappa,
+                                         n_items, n_topics, n_vocab, n_d)
 
-        # --- Step 4: Compute rating predictions and gradients ---
+        # 4) Rating gradients (vectorised batch)
         pred = predict_ratings(train, mu, P, Q, b_u, b_i)
-        err = pred - ratings  # (n_ratings,)
-        rating_loss = np.mean(err ** 2)
+        err = pred - ratings
+        err_2 = 2 * err / n_ratings
 
-        # Accumulate rating gradients per user / item (vectorised)
-        grad_P = np.zeros_like(P)
+        grad_P       = np.zeros_like(P)
         grad_Q_rating = np.zeros_like(Q)
-        grad_bu = np.zeros_like(b_u)
-        grad_bi = np.zeros_like(b_i)
+        grad_bu      = np.zeros_like(b_u)
+        grad_bi      = np.zeros_like(b_i)
 
-        err_2 = 2 * err / n_ratings  # (n_ratings,)
         np.add.at(grad_bu, users, err_2)
         np.add.at(grad_bi, items, err_2)
-        np.add.at(grad_P, users, err_2[:, None] * Q[items])
+        np.add.at(grad_P,  users, err_2[:, None] * Q[items])
         np.add.at(grad_Q_rating, items, err_2[:, None] * P[users])
 
-        # Add regularisation
         grad_bu += 2 * reg * b_u
         grad_bi += 2 * reg * b_i
         grad_P  += 2 * reg * P
-        # Q is regularised by the corpus term, not by lambda
 
-        # --- Step 5: Combine rating and corpus gradients for Q ---
-        total_words = sum(len(d) for d in doc_words)
-        grad_Q = grad_Q_rating - mu_corpus * grad_q_corpus / total_words
-        grad_psi = -mu_corpus * grad_psi_corpus / total_words
-        grad_kappa = -mu_corpus * grad_kappa_corpus / total_words
+        # 5) Combine rating and corpus gradients
+        #    Corpus gradient is divided by total_words so that mu_corpus ~ 1
+        #    is a neutral, per-observation trade-off
+        grad_Q     = grad_Q_rating - mu_corpus * grad_q_corpus   / total_words
+        grad_psi   =                - mu_corpus * grad_psi_corpus / total_words
+        grad_kappa =                - mu_corpus * grad_kappa_corpus / total_words
 
-        # --- Step 6: Adam updates ---
+        # 6) Adam updates
         def adam_update(name, param, grad):
             adam[name]['m'] = beta1 * adam[name]['m'] + (1 - beta1) * grad
             adam[name]['v'] = beta2 * adam[name]['v'] + (1 - beta2) * grad ** 2
             return param - lr * adam[name]['m'] / (np.sqrt(adam[name]['v']) + eps)
 
-        P = adam_update('P', P, grad_P)
-        Q = adam_update('Q', Q, grad_Q)
+        P   = adam_update('P',   P,   grad_P)
+        Q   = adam_update('Q',   Q,   grad_Q)
         b_u = adam_update('b_u', b_u, grad_bu)
         b_i = adam_update('b_i', b_i, grad_bi)
         psi = adam_update('psi', psi, grad_psi)
@@ -270,56 +269,67 @@ def fit_lda_lfm(train, valid, doc_words, uid2idx, sid2idx,
         adam['kappa']['v'] = beta2 * adam['kappa']['v'] + (1 - beta2) * grad_kappa ** 2
         kappa = kappa - lr * adam['kappa']['m'] / (np.sqrt(adam['kappa']['v']) + eps)
 
-        # --- Step 7: Validation and early stopping ---
-        val_pred = predict_ratings(valid, mu, P, Q, b_u, b_i)
-        val_mse = np.mean((val_pred - valid['overall'].values) ** 2)
+        # 7) Checkpoint: evaluate on validation and snapshot
+        if (epoch + 1) in checkpoint_set:
+            val_pred = predict_ratings(valid, mu, P, Q, b_u, b_i)
+            val_mse = float(np.mean((val_pred - valid['overall'].values) ** 2))
+            checkpoints[epoch + 1] = (
+                val_mse,
+                (mu, P.copy(), Q.copy(), b_u.copy(), b_i.copy(),
+                 psi.copy(), float(kappa)),
+            )
 
-        print(f"  Epoch {epoch+1}/{n_epochs}, "
-              f"train MSE: {rating_loss:.4f}, "
-              f"valid MSE: {val_mse:.4f}, "
-              f"lk: {lk:.1f}, "
-              f"kappa: {kappa:.3f}")
-
-        if val_mse < best_val_mse:
-            best_val_mse = val_mse
-            best_epoch = epoch + 1
-            best_params = (mu, P.copy(), Q.copy(), b_u.copy(), b_i.copy(),
-                           psi.copy(), kappa)
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                print(f"  Early stopping at epoch {epoch+1}. "
-                      f"Best epoch: {best_epoch} (valid MSE: {best_val_mse:.4f})")
-                break
-
-    return best_params
+    return checkpoints
 
 
 # ---------------------------------------------------------------------------
-# 7. Full pipeline
+# 8. Full pipeline with grid-search tuning
 # ---------------------------------------------------------------------------
-def run_lda_lfm(train, valid, test, uid2idx, sid2idx,
-                n_topics=10, n_vocab=5000, n_epochs=100,
-                lr=0.005, reg=0.02, mu_corpus=1.0, kappa_init=1.0,
-                patience=5):
-    """Run the full LDA-LFM pipeline."""
-
+def run_lda_lfm_tuned(train, valid, test, uid2idx, sid2idx,
+                      n_topics=10, n_vocab=5000):
+    """
+    Build the corpus once, then grid-search lr, reg, mu_corpus on the
+    validation set using the checkpoint trick for n_epochs. Evaluate the
+    best configuration on the test set. Mirrors run_lfm_tuned in LFM.py.
+    """
     print("Building corpus...")
     doc_words, dictionary = build_corpus(train, sid2idx, n_vocab)
+    actual_n_vocab = len(dictionary)
 
-    print("Fitting LDA-LFM...")
-    params = fit_lda_lfm(
-        train, valid, doc_words, uid2idx, sid2idx,
-        n_topics=n_topics, n_vocab=len(dictionary),
-        n_epochs=n_epochs, lr=lr, reg=reg,
-        mu_corpus=mu_corpus, kappa_init=kappa_init,
-        patience=patience
-    )
+    lr_grid    = [0.05, 0.1, 0.15]
+    reg_grid   = [0.02, 1.0, 10.0]
+    mu_grid    = [1.0, 10.0, 100]
+    epoch_grid = [5, 20, 50, 100, 200]
+
+    best_val_mse = np.inf
+    best = None  # (lr, reg, mu_c, n_ep, params)
+
+    print("Tuning LDA-LFM...")
+    for lr in lr_grid:
+        for reg in reg_grid:
+            for mu_c in mu_grid:
+                ckpts = fit_lda_lfm(
+                    train, valid, doc_words, uid2idx, sid2idx,
+                    n_topics=n_topics, n_vocab=actual_n_vocab,
+                    lr=lr, reg=reg, mu_corpus=mu_c,
+                    checkpoint_epochs=epoch_grid,
+                )
+
+                for n_ep, (vmse, params) in ckpts.items():
+                    if vmse < best_val_mse:
+                        best_val_mse = vmse
+                        best = (lr, reg, mu_c, n_ep, params)
+
+                ckpts_str = " ".join(
+                    f"@{ep}={ckpts[ep][0]:.4f}" for ep in sorted(ckpts.keys())
+                )
+                print(f"  lr={lr}, reg={reg}, mu={mu_c}: val {ckpts_str}")
+
+    lr, reg, mu_c, n_ep, params = best
+    print(f"\n  Best LDA-LFM: lr={lr}, reg={reg}, mu={mu_c}, "
+          f"epochs={n_ep}, val MSE={best_val_mse:.4f}")
 
     mu, P, Q, b_u, b_i, psi, kappa = params
-
-    print("Evaluating on test set...")
     test_pred = predict_ratings(test, mu, P, Q, b_u, b_i)
     results = evaluate(test_pred, test['overall'].values)
 
@@ -332,15 +342,14 @@ def run_lda_lfm(train, valid, test, uid2idx, sid2idx,
 if __name__ == '__main__':
     import time
 
-    DATA_PATH = '/Users/gavinshao/Desktop/Master Thesis/Code/Data/reviews_Electronics_5.json.gz'
+    DATA_PATH = '/Users/gavinshao/Desktop/Master Thesis/Code/Data/reviews_Beauty_5.json.gz'
 
     data = load_amazon_gz(DATA_PATH)
     train, valid, test, uid2idx, sid2idx = split_data(data, seed=42)
 
     t = time.time()
-    results, params, dictionary = run_lda_lfm(
-        train, valid, test, uid2idx, sid2idx,
-        n_topics=10, mu_corpus=1, reg=0.02, n_epochs=50
+    results, params, dictionary = run_lda_lfm_tuned(
+        train, valid, test, uid2idx, sid2idx, n_topics=10,
     )
     elapsed = time.time() - t
 

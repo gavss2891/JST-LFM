@@ -14,12 +14,14 @@ import numpy as np
 from surprise import SVD, Dataset, Reader, accuracy
 
 from data_preprocessing import load_amazon_gz, print_stats, split_data
-from LDAFirst import run_lda_first
+from LDAFirst import run_lda_first_tuned
+from LFM import run_lfm_tuned
+from LDA_LFM import run_lda_lfm_tuned
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DATA_PATH = '/Users/gavinshao/Desktop/Master Thesis/Code/Data/reviews_Electronics_5.json.gz'
+DATA_PATH = '/Users/gavinshao/Desktop/Master Thesis/Code/Data/reviews_Beauty_5.json.gz'
 SEED = 42
 
 # ---------------------------------------------------------------------------
@@ -40,7 +42,6 @@ def evaluate(predictions, true_ratings):
     errors = predictions - true_ratings
     return {
         'MSE':  np.mean(errors ** 2),
-        'RMSE': np.sqrt(np.mean(errors ** 2)),
         'MAE':  np.mean(np.abs(errors)),
     }
 
@@ -65,27 +66,6 @@ def baseline_rating_model(train, test):
     return evaluate(predictions, test['overall'].values)
 
 # ---------------------------------------------------------------------------
-# Model 3: Latent Factor Model (SVD: mu + b_u + b_i + p_u^T q_i)
-# ---------------------------------------------------------------------------
-def run_lfm(train, test, n_factors=10, n_epochs=35, lr=0.005, reg=0.02):
-    reader = Reader(rating_scale=(1, 5))
-    train_data = Dataset.load_from_df(
-        train[['reviewerID', 'asin', 'overall']], reader
-    ).build_full_trainset()
-    test_data = list(zip(
-        test['reviewerID'].values, test['asin'].values, test['overall'].values
-    ))
-
-    model = SVD(n_factors=n_factors, n_epochs=n_epochs, lr_all=lr, reg_all=reg,
-                biased=True, random_state=SEED, verbose=False)
-    model.fit(train_data)
-    predictions = model.test(test_data)
-
-    rmse = accuracy.rmse(predictions, verbose=False)
-    mae  = accuracy.mae(predictions, verbose=False)
-    return model, {'MSE': rmse ** 2, 'RMSE': rmse, 'MAE': mae}
-
-# ---------------------------------------------------------------------------
 # Run all models and collect results
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
@@ -95,25 +75,34 @@ if __name__ == '__main__':
     t = time.time()
     all_results['Offset Model'] = offset_model(train, test)
     all_results['Offset Model']['Time'] = time.time() - t
+    print(f"Offset Model Completed: Time={all_results['Offset Model']['Time']:.2f}s")
 
     t = time.time()
     all_results['Baseline Rating'] = baseline_rating_model(train, test)
     all_results['Baseline Rating']['Time'] = time.time() - t
+    print(f"Baseline Rating Completed: Time={all_results['Baseline Rating']['Time']:.2f}s")
 
     t = time.time()
-    _, lfm_results = run_lfm(train, test)
-    all_results['LFM'] = lfm_results
+    all_results['LFM'] = run_lfm_tuned(train, valid, test, uid2idx, sid2idx, n_factors=10)
     all_results['LFM']['Time'] = time.time() - t
-
+    print(f"LFM Completed: Time={all_results['LFM']['Time']:.2f}s")
+    
     t = time.time()
-    lda_results, _, _ = run_lda_first(train, valid, test, uid2idx, sid2idx)
+    lda_results, _, _ = run_lda_first_tuned(train, valid, test, uid2idx, sid2idx)
     all_results['LDAFirst'] = lda_results
     all_results['LDAFirst']['Time'] = time.time() - t
+    print(f"LDAFirst Completed: Time={all_results['LDAFirst']['Time']:.2f}s")
+
+    t = time.time()
+    lda_lfm_results, _, _ = run_lda_lfm_tuned(train, valid, test, uid2idx, sid2idx)
+    all_results['LDA-LFM'] = lda_lfm_results
+    all_results['LDA-LFM']['Time'] = time.time() - t
+    print(f"LDA-LFM Completed: Time={all_results['LDA-LFM']['Time']:.2f}s")
 
     # -----------------------------------------------------------------------
     # Print results table
     # -----------------------------------------------------------------------
-    metrics = ['MSE', 'RMSE', 'MAE', 'Time']
+    metrics = ['MSE', 'MAE', 'Time']
     col_w = 12
     name_w = 20
 
@@ -127,10 +116,11 @@ if __name__ == '__main__':
     print(sep)
     for name, res in all_results.items():
         row = f"{name:<{name_w}}"
-        for m in ['MSE', 'RMSE', 'MAE']:
+        for m in ['MSE', 'MAE']:
             row += f"{res[m]:>{col_w}.4f}"
         row += f"{res['Time']:>{col_w}.2f}s"
         print(row)
     print("=" * len(header))
     print(f"\nGlobal average rating: {train['overall'].mean():.4f}")
     print(f"Users: {n_users:,}  |  Items: {n_items:,}")
+
