@@ -14,69 +14,8 @@ import numpy as np
 
 from data_preprocessing import load_amazon_gz, split_data
 
-
 # ---------------------------------------------------------------------------
-# 1. Train LFM with Adam
-# ---------------------------------------------------------------------------
-def train_lfm(train, uid2idx, sid2idx, n_factors=10, n_epochs=35,
-              lr=0.005, reg=0.02, beta1=0.9, beta2=0.999, eps=1e-8):
-    """Train LFM with Adam. Returns mu, P, Q, b_u, b_i."""
-    n_users = len(uid2idx)
-    n_items = len(sid2idx)
-    mu = train['overall'].mean()
-
-    rng = np.random.RandomState(42)
-    P = rng.normal(0, 0.01, (n_users, n_factors)).astype(np.float64)
-    Q = rng.normal(0, 0.01, (n_items, n_factors)).astype(np.float64)
-    b_u = np.zeros(n_users, dtype=np.float64)
-    b_i = np.zeros(n_items, dtype=np.float64)
-
-    # Adam state
-    adam = {name: {'m': np.zeros_like(p), 'v': np.zeros_like(p)}
-            for name, p in [('P', P), ('Q', Q), ('b_u', b_u), ('b_i', b_i)]}
-
-    users = train['user_idx'].values
-    items = train['item_idx'].values
-    ratings = train['overall'].values.astype(np.float64)
-    n_ratings = len(ratings)
-
-    for epoch in range(n_epochs):
-        pred = mu + b_u[users] + b_i[items] + np.sum(P[users] * Q[items], axis=1)
-        err = pred - ratings
-
-        # Gradients (normalised by n_ratings)
-        err_2 = 2 * err / n_ratings
-        g_bu = np.zeros_like(b_u)
-        g_bi = np.zeros_like(b_i)
-        g_P = np.zeros_like(P)
-        g_Q = np.zeros_like(Q)
-
-        np.add.at(g_bu, users, err_2)
-        np.add.at(g_bi, items, err_2)
-        np.add.at(g_P, users, err_2[:, None] * Q[items])
-        np.add.at(g_Q, items, err_2[:, None] * P[users])
-
-        g_bu += 2 * reg * b_u
-        g_bi += 2 * reg * b_i
-        g_P += 2 * reg * P
-        g_Q += 2 * reg * Q
-
-        # Adam updates
-        for name, param, grad in [('b_u', b_u, g_bu), ('b_i', b_i, g_bi),
-                                   ('P', P, g_P), ('Q', Q, g_Q)]:
-            adam[name]['m'] = beta1 * adam[name]['m'] + (1 - beta1) * grad
-            adam[name]['v'] = beta2 * adam[name]['v'] + (1 - beta2) * grad ** 2
-
-        b_u = b_u - lr * adam['b_u']['m'] / (np.sqrt(adam['b_u']['v']) + eps)
-        b_i = b_i - lr * adam['b_i']['m'] / (np.sqrt(adam['b_i']['v']) + eps)
-        P = P - lr * adam['P']['m'] / (np.sqrt(adam['P']['v']) + eps)
-        Q = Q - lr * adam['Q']['m'] / (np.sqrt(adam['Q']['v']) + eps)
-
-    return mu, P, Q, b_u, b_i
-
-
-# ---------------------------------------------------------------------------
-# 2. Predict and evaluate
+# 1. Predict and evaluate
 # ---------------------------------------------------------------------------
 def predict_lfm(data, mu, P, Q, b_u, b_i):
     users = data['user_idx'].values
@@ -87,42 +26,149 @@ def predict_lfm(data, mu, P, Q, b_u, b_i):
 def evaluate(predictions, true_ratings):
     errors = predictions - true_ratings
     return {
-        'MSE':  np.mean(errors ** 2),
-        'MAE':  np.mean(np.abs(errors)),
+        'MSE': np.mean(errors ** 2),
+        'MAE': np.mean(np.abs(errors)),
     }
+
+
+# ---------------------------------------------------------------------------
+# 2. Fit LFM model
+# ---------------------------------------------------------------------------
+def _fit_lfm(train, valid, uid2idx, sid2idx, n_factors,
+             lr, reg, n_epochs=300,
+             beta1=0.9, beta2=0.999, eps=1e-8):
+    """Train LFM with Adam, evaluating val MSE every epoch. Returns best epoch's params."""
+    n_users = len(uid2idx)
+    n_items = len(sid2idx)
+    mu = train['overall'].mean()
+
+    rng = np.random.RandomState(42)
+    P = rng.normal(0, 0.01, (n_users, n_factors)).astype(np.float64)
+    Q = rng.normal(0, 0.01, (n_items, n_factors)).astype(np.float64)
+    b_u = np.zeros(n_users, dtype=np.float64)
+    b_i = np.zeros(n_items, dtype=np.float64)
+
+    adam = {name: {'m': np.zeros_like(p), 'v': np.zeros_like(p)}
+            for name, p in [('P', P), ('Q', Q), ('b_u', b_u), ('b_i', b_i)]}
+
+    users = train['user_idx'].values
+    items = train['item_idx'].values
+    ratings = train['overall'].values.astype(np.float64)
+    n_ratings = len(ratings)
+
+    mse_history = []
+    _best_vmse = np.inf
+    _best_epoch = -1
+    _best_params = None
+    _patience_counter = 0
+    _prev_vmse = np.inf
+    _loss_diff_counter = 0
+
+    for epoch in range(n_epochs):
+        pred = mu + b_u[users] + b_i[items] + np.sum(P[users] * Q[items], axis=1)
+        err = pred - ratings
+        err_2 = 2 * err / n_ratings
+
+        g_bu = np.zeros_like(b_u)
+        g_bi = np.zeros_like(b_i)
+        g_P  = np.zeros_like(P)
+        g_Q  = np.zeros_like(Q)
+
+        np.add.at(g_bu, users, err_2)
+        np.add.at(g_bi, items, err_2)
+        np.add.at(g_P,  users, err_2[:, None] * Q[items])
+        np.add.at(g_Q,  items, err_2[:, None] * P[users])
+
+        g_bu += 2 * reg * b_u
+        g_bi += 2 * reg * b_i
+        g_P  += 2 * reg * P
+        g_Q  += 2 * reg * Q
+
+        t = epoch + 1
+        for name, grad in [('b_u', g_bu), ('b_i', g_bi), ('P', g_P), ('Q', g_Q)]:
+            adam[name]['m'] = beta1 * adam[name]['m'] + (1 - beta1) * grad
+            adam[name]['v'] = beta2 * adam[name]['v'] + (1 - beta2) * grad ** 2
+
+        bc1 = 1.0 - beta1 ** t
+        bc2 = 1.0 - beta2 ** t
+        b_u = b_u - lr * (adam['b_u']['m'] / bc1) / (np.sqrt(adam['b_u']['v'] / bc2) + eps)
+        b_i = b_i - lr * (adam['b_i']['m'] / bc1) / (np.sqrt(adam['b_i']['v'] / bc2) + eps)
+        P   = P   - lr * (adam['P']['m']   / bc1) / (np.sqrt(adam['P']['v']   / bc2) + eps)
+        Q   = Q   - lr * (adam['Q']['m']   / bc1) / (np.sqrt(adam['Q']['v']   / bc2) + eps)
+
+        val_pred = predict_lfm(valid, mu, P, Q, b_u, b_i)
+        val_mse = float(np.mean((val_pred - valid['overall'].values) ** 2))
+        mse_history.append((epoch + 1, val_mse))
+
+        if epoch >= 200:
+            if val_mse < _best_vmse:
+                _best_vmse = val_mse
+                _best_epoch = epoch + 1
+                _best_params = (mu, P.copy(), Q.copy(), b_u.copy(), b_i.copy())
+                _patience_counter = 0
+            else:
+                _patience_counter += 1
+                if _patience_counter >= 100:
+                    break
+            if abs(val_mse - _prev_vmse) < 1e-6:
+                _loss_diff_counter += 1
+                if _loss_diff_counter >= 10:
+                    break
+            else:
+                _loss_diff_counter = 0
+
+        _prev_vmse = val_mse
+
+    return _best_epoch, _best_vmse, _best_params, mse_history
 
 
 # ---------------------------------------------------------------------------
 # 3. Full pipeline with grid-search tuning
 # ---------------------------------------------------------------------------
 def run_lfm_tuned(train, valid, test, uid2idx, sid2idx, n_factors=10):
-    """Grid search over lr, reg, n_epochs on validation set, evaluate on test."""
-    lr_grid = [0.005, 0.01, 0.05]
-    reg_grid = [0.02, 1.0, 10.0]
-    epoch_grid = [5, 20, 50]
+    """Grid search over lr, reg, n_epochs on validation set, evaluate on test.
+
+    Returns
+    -------
+    results          : dict with MSE, MAE on test set
+    best_info        : dict with best lr, reg, mu (NaN), epochs
+    tuning_rows      : list of dicts (one per combo × epoch) for CSV logging
+    best_mse_history : list of (epoch, val_mse) for the best combo
+    """
+    lr_grid  = [0.01, 0.02]
+    reg_grid = [0.001]
+    n_epochs = 1000
 
     best_val_mse = np.inf
-    best_params = None
+    best = None
+    tuning_rows = []
+    best_mse_history = None
 
+    print("Tuning LFM...")
     for lr in lr_grid:
         for reg in reg_grid:
-            for n_epochs in epoch_grid:
-                mu, P, Q, b_u, b_i = train_lfm(
-                    train, uid2idx, sid2idx, n_factors, n_epochs, lr, reg
-                )
-                val_pred = predict_lfm(valid, mu, P, Q, b_u, b_i)
-                val_mse = np.mean((val_pred - valid['overall'].values) ** 2)
+            best_ep, best_vmse, params, mse_hist = _fit_lfm(
+                train, valid, uid2idx, sid2idx, n_factors,
+                lr=lr, reg=reg, n_epochs=n_epochs,
+            )
+            for ep, vmse in mse_hist:
+                tuning_rows.append({
+                    'lr': lr, 'reg': reg, 'mu': float('nan'),
+                    'n_epochs': ep, 'val_mse': vmse,
+                })
+            if best_vmse < best_val_mse:
+                best_val_mse = best_vmse
+                best = (lr, reg, best_ep, params)
+                best_mse_history = mse_hist
 
-                if val_mse < best_val_mse:
-                    best_val_mse = val_mse
-                    best_params = (lr, reg, n_epochs, mu, P, Q, b_u, b_i)
-
-    lr, reg, n_epochs, mu, P, Q, b_u, b_i = best_params
-    print(f"  Best LFM: lr={lr}, reg={reg}, epochs={n_epochs}, val MSE={best_val_mse:.4f}")
+    lr, reg, n_ep, (mu, P, Q, b_u, b_i) = best
+    print(f"  Best LFM: lr={lr}, reg={reg}, epochs={n_ep}, val MSE={best_val_mse:.4f}")
 
     test_pred = predict_lfm(test, mu, P, Q, b_u, b_i)
     results = evaluate(test_pred, test['overall'].values)
-    return results
+    results['test_pred'] = test_pred
+    best_info = {'lr': lr, 'reg': reg, 'mu': float('nan'), 'epochs': n_ep}
+    return results, best_info, tuning_rows, best_mse_history
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +183,7 @@ if __name__ == '__main__':
     train, valid, test, uid2idx, sid2idx = split_data(data, seed=42)
 
     t = time.time()
-    results = run_lfm_tuned(train, valid, test, uid2idx, sid2idx, n_factors=10)
+    results, _, _ = run_lfm_tuned(train, valid, test, uid2idx, sid2idx, n_factors=10)
     elapsed = time.time() - t
 
     print(f"\nLFM Results:")
