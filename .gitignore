@@ -1,5 +1,5 @@
-Data/
+Data*/
+results*/
 __pycache__/
-Data2023/
 notes.md
-results/
+**/.DS_Store

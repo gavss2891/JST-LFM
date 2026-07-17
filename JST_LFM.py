@@ -3,34 +3,27 @@ JST_LFM.py
 
 JST-LFM model: jointly optimises latent factor rating prediction with
 sentiment-aware topic modelling. Item factors q_{i,l} are sentiment-specific
-and linked to topic distributions theta_{d,k,l} via softmax over the topic
-axis (one softmax per sentiment):
+and linked to topic distributions theta[i,l,k] = softmax_k(kappa * q[i,l,k]);
+word distributions phi[l,k,w] are jointly optimised. The sentiment
+distribution pi[d,l] is count-based, not parameterised — it is recomputed
+at the start of each outer iteration from the current sentiment counts
+(methodology Eq. 24).
 
-    theta[i, l, k] = softmax_k(kappa * q[i, l, k])
+Prediction (Eq. 23): mu + b_u + b_i + sum_l p_{u,l}^T q_{i,l}
 
-Word distributions phi[l, k, w] = softmax_w(psi[l, k, w]) are jointly
-optimised. The sentiment distribution pi[d, l] is COUNT-BASED and NOT
-parameterised — it is recomputed at the start of each outer iteration
-from the current sentiment counts (see methodology Eq. 24).
+Gibbs sampler: Numba-JIT sequential pass jointly sampling (topic, sentiment)
+per token (Algorithm 3 of the methodology), cache=True; first call
+JIT-compiles (~10-15s).
 
-Rating prediction (methodology Eq. 23):
-    r_hat = mu + b_u + b_i + sum_l p_{u,l}^T q_{i,l}
-          = mu + b_u + b_i + p_u @ q_i   (using flat S*K-dim vectors)
-
-Gibbs sampler implementation: Numba-JIT sequential pass that, for each
-token, computes p(k, l) = pi[d, l] * theta[d, l, k] * phi[l, k, w],
-samples (z_j, l_j) jointly via inverse-CDF, and increments count matrices
-in place. Faithful to Algorithm 3 of the methodology (parametric theta/phi
-and count-based pi fixed within each iteration); only the bookkeeping is
-compiled. First call JIT-compiles (~10-15s); subsequent calls run at
-compiled speed thanks to cache=True.
-
-Sentiment labels: 0 = positive, 1 = negative, 2 = neutral.
-MPQA lexicon seeds initial sentiment assignments at iteration 1 only;
-after that, the joint rating-corpus gradient drives sentiment discovery.
+Sentiment labels: 0 = positive, 1 = negative, 2 = neutral. MPQA lexicon
+seeds initial sentiment assignments at iteration 1 only; after that, the
+joint rating-corpus gradient drives sentiment discovery.
 """
 
 import re
+import time as _time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 import numba
 from gensim import corpora
@@ -56,20 +49,20 @@ def build_corpus(train, sid2idx, n_vocab=5000):
     dictionary.filter_extremes(keep_n=n_vocab)
 
     n_items = len(sid2idx)
-    doc_words = [np.array([], dtype=np.int64) for _ in range(n_items)]
+    doc_words = [np.array([], dtype=np.int32) for _ in range(n_items)]
     seen = np.zeros(n_items, dtype=bool)
 
     for _, row in docs.iterrows():
         item_idx = sid2idx[row['asin']]
         word_ids = [dictionary.token2id[w] for w in row['tokens']
                     if w in dictionary.token2id]
-        doc_words[item_idx] = np.array(word_ids, dtype=np.int64)
+        doc_words[item_idx] = np.array(word_ids, dtype=np.int32)
         seen[item_idx] = True
 
-    n_d = np.array([len(d) for d in doc_words], dtype=np.int64)
+    n_d = np.array([len(d) for d in doc_words], dtype=np.int32)
     all_words = np.concatenate(doc_words) if n_d.sum() > 0 \
-                else np.array([], dtype=np.int64)
-    all_docs = np.repeat(np.arange(n_items, dtype=np.int64), n_d)
+                else np.array([], dtype=np.int32)
+    all_docs = np.repeat(np.arange(n_items, dtype=np.int32), n_d)
 
     print(f"Corpus: {n_items} items, {int(n_d.sum()):,} tokens, "
           f"vocab {len(dictionary)}, "
@@ -159,32 +152,18 @@ def _jst_lfm_sweep(all_words, all_docs,
                    N_klI, N_lkw, N_kl, N_lI,
                    all_topics, all_sents):
     """
-    One sequential sweep over the corpus for JST-LFM.
-
-    For each token j (with d = all_docs[j], w = all_words[j]):
-        probs[k*S + l] = pi_d[d, l] * theta[d, l, k] * phi[l, k, w]
-        (z_j, l_j)     ~ Multinomial(probs / sum probs)   via inverse CDF
-
-        all_topics[j] <- z_j
-        all_sents[j]  <- l_j
-        N_klI[d, l_j, z_j] += 1
-        N_lkw[l_j, z_j, w] += 1
-        N_kl[l_j, z_j]     += 1
-        N_lI[d, l_j]       += 1
-        lk          += log(probs[z_j * S + l_j])
-        grad_kappa  += Q_block[d, l_j, z_j] - eq_block[d, l_j]
-
-    theta, phi, pi_d, Q_block, eq_block are held fixed throughout the
-    sweep — matching Algorithm 3 of the methodology. Count matrices and
-    assignment arrays are modified in place; they must be zeroed (counts)
-    by the caller before calling this function.
+    One sequential Gibbs sweep over the corpus: for each token, jointly
+    samples (topic, sentiment) from pi[d,:] * theta[d,:,:] * phi[:,:,w] via
+    inverse-CDF, updates the count matrices in place, and accumulates the
+    log-likelihood and kappa gradient. theta, phi, pi_d, Q_block, eq_block
+    are held fixed for the whole sweep; count matrices must be zeroed by
+    the caller beforehand.
 
     Returns
     -------
     lk         : corpus log-likelihood contribution from theta and phi
-                 (pi contribution is count-based and has no gradient, so
-                 it's NOT added here; caller can track log(pi) separately
-                 if needed for monitoring the full likelihood)
+                 (pi is count-based and contributes no gradient, so it is
+                 excluded here)
     grad_kappa : scalar gradient accumulator for kappa
     """
     N_total = all_words.shape[0]
@@ -308,13 +287,13 @@ def fit_jst_lfm(train, valid, all_words, all_docs, n_d, seen,
 
     # --- Gibbs assignments: init random topic, lexicon-seeded sentiment ---
     N_total = int(all_words.shape[0])
-    all_topics = rng.randint(0, K, size=N_total).astype(np.int64)
-    all_sents  = rng.randint(0, S, size=N_total).astype(np.int64)
+    all_topics = rng.randint(0, K, size=N_total).astype(np.int32)
+    all_sents  = rng.randint(0, S, size=N_total).astype(np.int32)
 
     if lexicon:
         lex_ids = np.fromiter(lexicon.keys(), dtype=np.int64)
         lex_labels = np.fromiter(lexicon.values(), dtype=np.int64)
-        lookup = -np.ones(n_vocab, dtype=np.int64)
+        lookup = -np.ones(n_vocab, dtype=np.int32)
         lookup[lex_ids] = lex_labels
         seeded = lookup[all_words]
         mask = seeded >= 0
@@ -421,38 +400,37 @@ def fit_jst_lfm(train, valid, all_words, all_docs, n_d, seen,
         kappa = kappa - lr * (adam['kappa']['m'] / bc1) / (np.sqrt(adam['kappa']['v'] / bc2) + eps)
 
         # (H) Evaluate on validation every epoch; keep best params
+        train_mse = float(np.mean(err ** 2))
         val_pred = predict_ratings(valid, mu, P, Q, b_u, b_i)
         val_mse = float(np.mean((val_pred - valid['overall'].values) ** 2))
-        mse_history.append((epoch + 1, val_mse))
+        mse_history.append((epoch + 1, train_mse, val_mse))
 
-        if abs(val_mse - _prev_vmse) < 1e-6:
-            _loss_diff_counter += 1
-            if _loss_diff_counter >= 10:
-                break
-        else:
-            _loss_diff_counter = 0
+        if epoch >= 1:
+            if abs(val_mse - _prev_vmse) < 1e-6:
+                _loss_diff_counter += 1
+                if _loss_diff_counter >= 10:
+                    break
+            else:
+                _loss_diff_counter = 0
 
-        if val_mse < _best_vmse:
-            _best_vmse = val_mse
-            _best_epoch = epoch + 1
-            _best_params = (mu, P.copy(), Q.copy(), b_u.copy(), b_i.copy(),
-                            psi.copy(), float(kappa))
-            _patience_counter = 0
-        else:
-            _patience_counter += 1
-            if _patience_counter >= 100:
-                break
+            if val_mse < _best_vmse:
+                _best_vmse = val_mse
+                _best_epoch = epoch + 1
+                _best_params = (mu, P.copy(), Q.copy(), b_u.copy(), b_i.copy(),
+                                psi.copy(), float(kappa))
+                _patience_counter = 0
+            else:
+                _patience_counter += 1
+                if _patience_counter >= 300:
+                    break
 
         _prev_vmse = val_mse
 
-        if verbose:
+        if verbose and (epoch == 0 or (epoch + 1) % 10 == 0):
             dt = _time.time() - t_epoch
-            train_mse = float(np.mean(err ** 2))
-            print(f"      epoch {epoch+1}/{n_epochs}  "
-                  f"train MSE {train_mse:.4f}  "
-                  f"kappa {kappa:+.3f}  "
-                  f"lk {lk:.1f}  "
-                  f"dt {dt:.2f}s", flush=True)
+            print(f"      [JST-LFM lr={lr} reg={reg} mu={mu_corpus}] epoch {epoch+1}/{n_epochs}  "
+                  f"train MSE {train_mse:.4f}  val MSE {val_mse:.4f}  "
+                  f"kappa {kappa:+.3f}  lk {lk:.1f}  dt {dt:.2f}s", flush=True)
 
     return _best_epoch, _best_vmse, _best_params, mse_history
 
@@ -460,11 +438,26 @@ def fit_jst_lfm(train, valid, all_words, all_docs, n_d, seen,
 # ---------------------------------------------------------------------------
 # 8. Full pipeline with grid-search tuning
 # ---------------------------------------------------------------------------
+def _run_combo_jst_lfm(args):
+    (lr, reg, mu_c, train, valid, all_words, all_docs, n_d, seen,
+     lexicon, uid2idx, sid2idx, n_vocab, K, S, alpha, beta, gamma,
+     n_epochs, seed, verbose) = args
+    best_ep, best_vmse, params, mse_hist = fit_jst_lfm(
+        train, valid, all_words, all_docs, n_d, seen,
+        lexicon, uid2idx, sid2idx,
+        n_vocab=n_vocab, K=K, S=S, alpha=alpha, beta=beta, gamma=gamma,
+        lr=lr, reg=reg, mu_corpus=mu_c,
+        n_epochs=n_epochs, seed=seed, verbose=verbose,
+    )
+    return lr, reg, mu_c, best_ep, best_vmse, params, mse_hist
+
+
 def run_jst_lfm_tuned(train, valid, test, uid2idx, sid2idx,
                      lexicon_path='MPQA_Subjectivity_Lexicon.tff',
                      K=10, S=3, n_vocab=5000,
                      alpha=5.0, beta=0.01, gamma=(0.1, 1, 10),
-                     min_freq=20, seed=42):
+                     min_freq=20, seed=42, verbose=False, n_workers=None,
+                     mu_grid=None):
     """
     Build the corpus once, load MPQA lexicon once, then grid-search
     (lr, reg, mu_corpus) × checkpoint epochs on validation. Evaluate the
@@ -478,8 +471,6 @@ def run_jst_lfm_tuned(train, valid, test, uid2idx, sid2idx,
     topic_words : dict {(k, l): [(word, prob), ...]} from best model's psi
     dictionary  : gensim Dictionary
     """
-    import time as _time
-
     print("Building corpus...")
     doc_words, dictionary, all_words, all_docs, n_d, seen = \
         build_corpus(train, sid2idx, n_vocab)
@@ -488,52 +479,57 @@ def run_jst_lfm_tuned(train, valid, test, uid2idx, sid2idx,
     lexicon = load_mpqa_lexicon(lexicon_path, dictionary, min_freq=min_freq)
     print(f"Lexicon: {len(lexicon):,} sentiment-tagged words (positive/negative)")
 
-    lr_grid  = [0.01, 0.02]
+    lr_grid  = [0.01]
     reg_grid = [0.001]
-    mu_grid  = [300.0, 600.0]
-    n_epochs = 1000
+    if mu_grid is None:
+        mu_grid = [1, 3, 5, 10, 30, 50, 100, 300, 500, 1000]
+    n_epochs = 5000
 
-    n_combos = len(lr_grid) * len(reg_grid) * len(mu_grid)
-    print(f"Tuning JST-LFM ({n_combos} combos × {n_epochs} epochs; "
-          f"first combo JIT-compiles, ~10-15s)...", flush=True)
-    t_tune = _time.time()
-    combo_idx = 0
+    combos = sorted([
+        (lr, reg, mu_c, train, valid, all_words, all_docs, n_d, seen,
+         lexicon, uid2idx, sid2idx, actual_n_vocab,
+         K, S, alpha, beta, gamma, n_epochs, seed, verbose)
+        for lr in lr_grid for reg in reg_grid for mu_c in mu_grid
+    ], key=lambda c: -c[2])
+    n_combos = len(combos)
 
     best_val_mse = np.inf
     best = None  # (lr, reg, mu_c, n_ep, params)
     tuning_rows = []
     best_mse_history = None
 
-    for lr in lr_grid:
-        for reg in reg_grid:
-            for mu_c in mu_grid:
-                combo_idx += 1
-                t_combo = _time.time()
-                best_ep, best_vmse, params, mse_hist = fit_jst_lfm(
-                    train, valid, all_words, all_docs, n_d, seen,
-                    lexicon, uid2idx, sid2idx,
-                    n_vocab=actual_n_vocab,
-                    K=K, S=S, alpha=alpha, beta=beta, gamma=gamma,
-                    lr=lr, reg=reg, mu_corpus=mu_c,
-                    n_epochs=n_epochs, seed=seed, verbose=False,
-                )
+    _n_workers = n_workers if n_workers is not None else n_combos
+    print(f"Tuning JST-LFM ({n_combos} combos, n_workers={_n_workers}; "
+          f"Numba cache=True, JIT on first run only)...", flush=True)
+    def _collect(i, lr, reg, mu_c, best_ep, best_vmse, params, mse_hist):
+        nonlocal best_val_mse, best, best_mse_history
+        elapsed = _time.time() - t_tune
+        print(f"  [{i}/{n_combos}] lr={lr}, reg={reg}, mu={mu_c}  "
+              f"best val {best_vmse:.4f} @ epoch {best_ep}  "
+              f"(elapsed {elapsed:.1f}s)", flush=True)
+        for ep, tmse, vmse in mse_hist:
+            tuning_rows.append({
+                'lr': lr, 'reg': reg, 'mu': mu_c,
+                'n_epochs': ep, 'train_mse': tmse, 'val_mse': vmse,
+            })
+        if best_vmse < best_val_mse:
+            best_val_mse = best_vmse
+            best = (lr, reg, mu_c, best_ep, params)
+            best_mse_history = mse_hist
 
-                for ep, vmse in mse_hist:
-                    tuning_rows.append({
-                        'lr': lr, 'reg': reg, 'mu': mu_c,
-                        'n_epochs': ep, 'val_mse': vmse,
-                    })
-                if best_vmse < best_val_mse:
-                    best_val_mse = best_vmse
-                    best = (lr, reg, mu_c, best_ep, params)
-                    best_mse_history = mse_hist
-
-                dt_combo = _time.time() - t_combo
-                elapsed  = _time.time() - t_tune
-                print(f"  [{combo_idx}/{n_combos}] lr={lr}, reg={reg}, mu={mu_c}  "
-                      f"best val {best_vmse:.4f} @ epoch {best_ep}  "
-                      f"(combo {dt_combo:.1f}s, elapsed {elapsed:.1f}s)",
-                      flush=True)
+    t_tune = _time.time()
+    if _n_workers == 1:
+        for i, c in enumerate(combos, 1):
+            _collect(i, *_run_combo_jst_lfm(c))
+    else:
+        i = 0
+        with ProcessPoolExecutor(max_workers=_n_workers) as ex:
+            for batch_start in range(0, n_combos, _n_workers):
+                batch = combos[batch_start:batch_start + _n_workers]
+                futures = {ex.submit(_run_combo_jst_lfm, c): c for c in batch}
+                for fut in as_completed(futures):
+                    i += 1
+                    _collect(i, *fut.result())
 
     lr, reg, mu_c, n_ep, params = best
     print(f"\n  Best JST-LFM: lr={lr}, reg={reg}, mu={mu_c}, "
@@ -547,7 +543,9 @@ def run_jst_lfm_tuned(train, valid, test, uid2idx, sid2idx,
 
     topic_words = top_words_per_topic_sentiment(psi, dictionary, top_n=10)
 
-    return results, best_info, tuning_rows, best_mse_history, topic_words, dictionary
+    best_params = {'mu': mu, 'P': P, 'Q': Q, 'b_u': b_u, 'b_i': b_i,
+                   'psi': psi, 'kappa': kappa, 'S': 3, 'K': psi.shape[1]}
+    return results, best_info, tuning_rows, best_mse_history, topic_words, dictionary, best_params
 
 
 # ---------------------------------------------------------------------------

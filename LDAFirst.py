@@ -15,6 +15,9 @@ lr, reg, and n_epochs on the validation set; the best model is then evaluated
 on the test set. LDA is built only once and reused across all grid combos.
 """
 
+import time as _time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 import gensim
 from gensim import corpora
@@ -25,7 +28,7 @@ from data_preprocessing import load_amazon_gz, split_data, clean
 # ---------------------------------------------------------------------------
 # 1. Build LDA topic distributions - run once before tuning
 # ---------------------------------------------------------------------------
-def build_lda(train, sid2idx, n_topics=10, n_vocab=5000, passes=1):
+def build_lda(train, sid2idx, n_topics=10, n_vocab=5000, passes=500):
     """
     Run LDA on training reviews grouped by item.
 
@@ -67,9 +70,7 @@ def build_lda(train, sid2idx, n_topics=10, n_vocab=5000, passes=1):
         for topic_id, prob in topic_dist:
             theta[item_idx, topic_id] = prob
         seen[item_idx] = True
-
-    # Cold items: replace the zero vector with the mean of seen items'
-    # distributions so p_u^T theta_i is a meaningful contribution.
+        
     if (~seen).any():
         if seen.any():
             theta[~seen] = theta[seen].mean(axis=0)
@@ -162,7 +163,7 @@ def evaluate(predictions, true_ratings):
 # ---------------------------------------------------------------------------
 def _fit_fixed_q(train, valid, theta, uid2idx, sid2idx,
                  lr, reg, n_epochs=300,
-                 beta1=0.9, beta2=0.999, eps=1e-8):
+                 beta1=0.9, beta2=0.999, eps=1e-8, verbose=False):
     """Train LFM-fixed-Q with Adam, evaluating val MSE every epoch. Returns best epoch's params."""
     n_users = len(uid2idx)
     n_items = len(sid2idx)
@@ -218,9 +219,10 @@ def _fit_fixed_q(train, valid, theta, uid2idx, sid2idx,
         b_i = b_i - lr * (adam['b_i']['m'] / bc1) / (np.sqrt(adam['b_i']['v'] / bc2) + eps)
         P   = P   - lr * (adam['P']['m']   / bc1) / (np.sqrt(adam['P']['v']   / bc2) + eps)
 
+        train_mse = float(np.mean(err ** 2))
         val_pred = predict_lfm_fixed_q(valid, mu, P, b_u, b_i, theta)
         val_mse = float(np.mean((val_pred - valid['overall'].values) ** 2))
-        mse_history.append((epoch + 1, val_mse))
+        mse_history.append((epoch + 1, train_mse, val_mse))
 
         if epoch >= 200:
             if val_mse < _best_vmse:
@@ -241,14 +243,27 @@ def _fit_fixed_q(train, valid, theta, uid2idx, sid2idx,
 
         _prev_vmse = val_mse
 
+        if verbose and (epoch == 0 or (epoch + 1) % 100 == 0):
+            print(f"      [LDAFirst lr={lr} reg={reg}] epoch {epoch+1}/{n_epochs}  "
+                  f"train MSE {train_mse:.4f}  val MSE {val_mse:.4f}", flush=True)
+
     return _best_epoch, _best_vmse, _best_params, mse_history
 
 
 # ---------------------------------------------------------------------------
 # 5. Full pipeline with grid-search tuning
 # ---------------------------------------------------------------------------
+def _run_combo_lda_first(args):
+    lr, reg, n_epochs, train, valid, theta, uid2idx, sid2idx, verbose = args
+    best_ep, best_vmse, params, mse_hist = _fit_fixed_q(
+        train, valid, theta, uid2idx, sid2idx,
+        lr=lr, reg=reg, n_epochs=n_epochs, verbose=verbose,
+    )
+    return lr, reg, best_ep, best_vmse, params, mse_hist
+
+
 def run_lda_first_tuned(train, valid, test, uid2idx, sid2idx,
-                        n_topics=10, n_vocab=5000, lda_passes=1):
+                        n_topics=10, n_vocab=5000, lda_passes=1, verbose=False, n_workers=None):
     """
     Build LDA features once, then grid search lr, reg, n_epochs on validation
     set and evaluate the best configuration on test set. Mirrors run_lfm_tuned.
@@ -264,26 +279,36 @@ def run_lda_first_tuned(train, valid, test, uid2idx, sid2idx,
         train, sid2idx, n_topics, n_vocab, passes=lda_passes,
     )
 
-    lr_grid  = [0.01, 0.02]
+    lr_grid  = [0.01]
     reg_grid = [0.001]
-    n_epochs = 1000
+    n_epochs = 5000
+
+    combos = [
+        (lr, reg, n_epochs, train, valid, theta, uid2idx, sid2idx, verbose)
+        for lr in lr_grid for reg in reg_grid
+    ]
+    n_combos = len(combos)
 
     best_val_mse = np.inf
     best = None
     tuning_rows = []
     best_mse_history = None
 
-    print("Tuning LDAFirst...")
-    for lr in lr_grid:
-        for reg in reg_grid:
-            best_ep, best_vmse, params, mse_hist = _fit_fixed_q(
-                train, valid, theta, uid2idx, sid2idx,
-                lr=lr, reg=reg, n_epochs=n_epochs,
-            )
-            for ep, vmse in mse_hist:
+    _n_workers = n_workers if n_workers is not None else n_combos
+    print(f"Tuning LDAFirst ({n_combos} combos, n_workers={_n_workers})...", flush=True)
+    t_tune = _time.time()
+    with ProcessPoolExecutor(max_workers=_n_workers) as ex:
+        futures = {ex.submit(_run_combo_lda_first, c): c for c in combos}
+        for i, fut in enumerate(as_completed(futures), 1):
+            lr, reg, best_ep, best_vmse, params, mse_hist = fut.result()
+            elapsed = _time.time() - t_tune
+            print(f"  [{i}/{n_combos}] lr={lr}, reg={reg}  "
+                  f"best val {best_vmse:.4f} @ epoch {best_ep}  "
+                  f"(elapsed {elapsed:.1f}s)", flush=True)
+            for ep, tmse, vmse in mse_hist:
                 tuning_rows.append({
                     'lr': lr, 'reg': reg, 'mu': float('nan'),
-                    'n_epochs': ep, 'val_mse': vmse,
+                    'n_epochs': ep, 'train_mse': tmse, 'val_mse': vmse,
                 })
             if best_vmse < best_val_mse:
                 best_val_mse = best_vmse

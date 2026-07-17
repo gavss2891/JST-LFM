@@ -11,6 +11,7 @@ test metrics are written to CSV files under results/<dataset>/.
 import csv
 import os
 from collections import defaultdict
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 import re
 import time
@@ -19,46 +20,47 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from data_preprocessing import load_amazon, print_stats, split_data, filter_k_core, plot_distributions, save_dataset_stats
+from data_preprocessing import load_amazon, print_stats, split_data, filter_k_core, plot_distributions, save_dataset_stats, clean
 from LDAFirst import run_lda_first_tuned
 from LFM import run_lfm_tuned
 from LDA_LFM import run_lda_lfm_tuned, top_words_per_topic
 from JSTFirst import run_jst_first_tuned
 from JST_LFM import run_jst_lfm_tuned
-from JST_LFM_asymmetric import run_jst_lfm_asym_tuned
+from JST_LFM_asymmetric import run_jst_lfm_asym_tuned, run_jst_lfm_asym_ks_tuned
 
 # ---------------------------------------------------------------------------
 # Config — add more paths to run over multiple datasets in one go
 # ---------------------------------------------------------------------------
 DATA_DIR = Path(os.getenv('DATA_DIR', 'data'))
 DATA_PATHS = [
-    # DATA_DIR / 'reviews_Musical_Instruments_5.json.gz',
-    # DATA_DIR / 'reviews_Amazon_Instant_Video_5.json.gz',
-    # DATA_DIR / 'reviews_Digital_Music_5.json.gz',
-    # DATA_DIR / 'reviews_Baby_5.json.gz',
-    # DATA_DIR / 'reviews_Patio_Lawn_and_Garden_5.json.gz',
-    # DATA_DIR / 'reviews_Pet_Supplies_5.json.gz', #-----assym starts here! 
-    # DATA_DIR / 'reviews_Office_Products_5.json.gz',
-    # DATA_DIR / 'reviews_Grocery_and_Gourmet_Food_5.json.gz',
-    # DATA_DIR / 'reviews_Video_Games_5.json.gz',
-    # DATA_DIR / 'reviews_Automotive_5.json.gz',
-    # DATA_DIR / 'reviews_Tools_and_Home_Improvement_5.json.gz',
-    # DATA_DIR / 'reviews_Beauty_5.json.gz',
-    # DATA_DIR / 'reviews_Toys_and_Games_5.json.gz' #-----assym stops here!
-    DATA_DIR / 'reviews_Apps_for_Android_5.json.gz', 
-    DATA_DIR / 'reviews_Health_and_Personal_Care_5.json.gz',
-    DATA_DIR / 'reviews_Kindle_Store_5.json.gz',
-    DATA_DIR / 'reviews_Sports_and_Outdoors_5.json.gz',
-    DATA_DIR / 'reviews_Cell_Phones_and_Accessories_5.json.gz',
-    DATA_DIR / 'reviews_CDs_and_Vinyl_5.json.gz',
-    DATA_DIR / 'reviews_Home_and_Kitchen_5.json.gz',
-    DATA_DIR / 'reviews_Movies_and_TV_5.json.gz',
+    DATA_DIR / 'reviews_Musical_Instruments_5.json.gz',
+    DATA_DIR / 'reviews_Automotive_5.json.gz',
+    DATA_DIR / 'reviews_Patio_Lawn_and_Garden_5.json.gz',
+    DATA_DIR / 'reviews_Amazon_Instant_Video_5.json.gz',
+    DATA_DIR / 'reviews_Office_Products_5.json.gz',
+    DATA_DIR / 'reviews_Digital_Music_5.json.gz',
+    DATA_DIR / 'reviews_Pet_Supplies_5.json.gz',
+    DATA_DIR / 'reviews_Baby_5.json.gz',
+    DATA_DIR / 'reviews_Grocery_and_Gourmet_Food_5.json.gz',
+    DATA_DIR / 'reviews_Tools_and_Home_Improvement_5.json.gz',
+    DATA_DIR / 'reviews_Toys_and_Games_5.json.gz',
     DATA_DIR / 'reviews_Clothing_Shoes_and_Jewelry_5.json.gz',
+    DATA_DIR / 'reviews_Beauty_5.json.gz',
+    DATA_DIR / 'reviews_Cell_Phones_and_Accessories_5.json.gz',
+    DATA_DIR / 'reviews_Sports_and_Outdoors_5.json.gz',
+    DATA_DIR / 'reviews_Apps_for_Android_5.json.gz',
+    DATA_DIR / 'reviews_Health_and_Personal_Care_5.json.gz',
+    DATA_DIR / 'reviews_Video_Games_5.json.gz',
+    DATA_DIR / 'reviews_Home_and_Kitchen_5.json.gz',
+    DATA_DIR / 'reviews_Kindle_Store_5.json.gz',
+    DATA_DIR / 'reviews_CDs_and_Vinyl_5.json.gz',
     DATA_DIR / 'reviews_Electronics_5.json.gz',
+    DATA_DIR / 'reviews_Movies_and_TV_5.json.gz',
 ]
 
 LEXICON_PATH = 'MPQA_Subjectivity_Lexicon.tff'
 SEED = 42
+N_TUNE_WORKERS = 4  # None = all combos in parallel (all 8 cores)
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +89,7 @@ def save_epoch_plot(tuning_rows, best_info, out_path, model_name):
     combos = defaultdict(list)
     for row in tuning_rows:
         key = (row['lr'], row['reg'], row['mu']) if has_mu else (row['lr'], row['reg'])
-        combos[key].append((row['n_epochs'], row['val_mse']))
+        combos[key].append((row['n_epochs'], row.get('train_mse'), row['val_mse']))
     for key in combos:
         combos[key].sort()
 
@@ -102,8 +104,8 @@ def save_epoch_plot(tuning_rows, best_info, out_path, model_name):
 
     for ax, key in zip(axes, keys):
         history = combos[key]
-        epochs = [ep  for ep, _   in history]
-        mses   = [mse for _,  mse in history]
+        epochs   = [ep   for ep, _, vmse in history]
+        val_mses = [vmse for _,  _, vmse in history]
 
         if has_mu:
             lr, reg, mu = key
@@ -114,19 +116,19 @@ def save_epoch_plot(tuning_rows, best_info, out_path, model_name):
             is_best = (lr == best_lr and reg == best_reg)
             title = f'lr={lr}, reg={reg}'
 
-        color = 'red' if is_best else 'steelblue'
-        ax.plot(epochs, mses, linewidth=1.2, color=color)
+        line_color = 'red' if is_best else 'steelblue'
+        ax.plot(epochs, val_mses, linewidth=1.2, color=line_color, label='val MSE')
         if is_best:
-            ax.axvline(best_ep, color='red', linestyle='--', linewidth=1,
+            ax.axvline(best_ep, color='red', linestyle=':', linewidth=1,
                        label=f'best epoch={best_ep}')
-            ax.legend(fontsize=7)
             for spine in ax.spines.values():
                 spine.set_edgecolor('red')
                 spine.set_linewidth(2)
             title += ' [BEST]'
+        ax.legend(fontsize=6)
         ax.set_title(title, fontsize=8)
         ax.set_xlabel('Epoch', fontsize=7)
-        ax.set_ylabel('Val MSE', fontsize=7)
+        ax.set_ylabel('MSE', fontsize=7)
         ax.tick_params(labelsize=7)
 
     for ax in axes[n:]:
@@ -141,7 +143,7 @@ def save_epoch_plot(tuning_rows, best_info, out_path, model_name):
 def write_tuning_csv(path, rows):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['lr', 'reg', 'mu', 'n_epochs', 'val_mse'])
+        writer = csv.DictWriter(f, fieldnames=['lr', 'reg', 'mu', 'n_epochs', 'train_mse', 'val_mse'])
         writer.writeheader()
         writer.writerows(rows)
 
@@ -216,7 +218,6 @@ def evaluate(predictions, true_ratings):
     }
 
 
-
 # ---------------------------------------------------------------------------
 # Model 1: Offset Model (predict global mean for all)
 # ---------------------------------------------------------------------------
@@ -242,7 +243,6 @@ def baseline_rating_model(train, test):
     res['test_pred'] = predictions
     return res
 
-
 # ---------------------------------------------------------------------------
 # Per-dataset pipeline
 # ---------------------------------------------------------------------------
@@ -258,8 +258,7 @@ def run_pipeline(data_path, k_core=5):
     data = load_amazon(data_path)
     print("Pre-filter stats:")
     print_stats(data)
-    plot_distributions(data, dataset_name=name, out_dir=out_dir)
-    save_dataset_stats(data, dataset_name=name, out_dir=out_dir)
+    # plot_distributions(data, dataset_name=name, out_dir=out_dir)
 
     # data = filter_k_core(data, k=k_core)
     # if len(data) == 0:
@@ -269,39 +268,48 @@ def run_pipeline(data_path, k_core=5):
     # print_stats(data)
 
     train, valid, test, uid2idx, sid2idx = split_data(data, seed=SEED)
+    print("Cleaning training reviews...", flush=True)
+    with Pool(cpu_count()) as p:
+        train['tokens'] = p.map(clean, train['reviewText'])
+    save_dataset_stats(data, dataset_name=name, out_dir=out_dir, train=train, sid2idx=sid2idx)
     final_rows = []
 
-    # -- Offset Model -------------------------------------------------------
-    t = time.time()
-    res = offset_model(train, test)
-    res['Time'] = time.time() - t
-    print(f"Offset Model: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  "
-          f"Time={res['Time']:.2f}s")
-    final_rows.append({
-        'model': 'Offset', 'best_lr': '', 'best_reg': '', 'best_mu': '',
-        'best_epochs': '',
-        'test_mse': res['MSE'], 'test_mae': res['MAE'],
-        'runtime_sec': res['Time'],
-    })
+    all_preds = {}
 
-    # -- Baseline Rating ----------------------------------------------------
-    t = time.time()
-    res = baseline_rating_model(train, test)
-    res['Time'] = time.time() - t
-    print(f"Baseline Rating: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  "
-          f"Time={res['Time']:.2f}s")
-    final_rows.append({
-        'model': 'Baseline', 'best_lr': '', 'best_reg': '', 'best_mu': '',
-        'best_epochs': '',
-        'test_mse': res['MSE'], 'test_mae': res['MAE'],
-        'runtime_sec': res['Time'],
-    })
+    # # -- Offset Model -------------------------------------------------------
+    # t = time.time()
+    # res = offset_model(train, test)
+    # res['Time'] = time.time() - t
+    # print(f"Offset Model: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  "
+    #       f"Time={res['Time']:.2f}s")
+    # all_preds['Offset'] = res.get('test_pred')
+    # final_rows.append({
+    #     'model': 'Offset', 'best_lr': '', 'best_reg': '', 'best_mu': '',
+    #     'best_epochs': '',
+    #     'test_mse': res['MSE'], 'test_mae': res['MAE'],
+    #     'runtime_sec': res['Time'],
+    # })
+
+    # # -- Baseline Rating ----------------------------------------------------
+    # t = time.time()
+    # res = baseline_rating_model(train, test)
+    # res['Time'] = time.time() - t
+    # print(f"Baseline Rating: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  "
+    #       f"Time={res['Time']:.2f}s")
+    # all_preds['Baseline'] = res.get('test_pred')
+    # final_rows.append({
+    #     'model': 'Baseline', 'best_lr': '', 'best_reg': '', 'best_mu': '',
+    #     'best_epochs': '',
+    #     'test_mse': res['MSE'], 'test_mae': res['MAE'],
+    #     'runtime_sec': res['Time'],
+    # })
 
     # -- LFM ----------------------------------------------------------------
     t = time.time()
-    res, best, tuning, epoch_mse = run_lfm_tuned(train, valid, test, uid2idx, sid2idx, n_factors=15)
+    res, best, tuning, epoch_mse = run_lfm_tuned(train, valid, test, uid2idx, sid2idx, n_factors=15, verbose=False, n_workers=N_TUNE_WORKERS)
     elapsed = time.time() - t
     print(f"LFM: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  Time={elapsed:.2f}s")
+    all_preds['LFM'] = res.get('test_pred')
     write_tuning_csv(os.path.join(out_dir, 'LFM_tuning.csv'), tuning)
     save_epoch_plot(tuning, best, os.path.join(out_dir, 'LFM_epoch_mse.png'), 'LFM')
     final_rows.append({
@@ -315,9 +323,10 @@ def run_pipeline(data_path, k_core=5):
     # -- LDAFirst -----------------------------------------------------------
     t = time.time()
     res, best, tuning, epoch_mse = run_lda_first_tuned(
-        train, valid, test, uid2idx, sid2idx, n_topics=15)
+        train, valid, test, uid2idx, sid2idx, n_topics=15, verbose=False, n_workers=N_TUNE_WORKERS)
     elapsed = time.time() - t
     print(f"LDAFirst: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  Time={elapsed:.2f}s")
+    all_preds['LDAFirst'] = res.get('test_pred')
     write_tuning_csv(os.path.join(out_dir, 'LDAFirst_tuning.csv'), tuning)
     save_epoch_plot(tuning, best, os.path.join(out_dir, 'LDAFirst_epoch_mse.png'), 'LDAFirst')
     final_rows.append({
@@ -330,13 +339,14 @@ def run_pipeline(data_path, k_core=5):
 
     # -- LDA-LFM ------------------------------------------------------------
     t = time.time()
-    res, best, tuning, epoch_mse, psi, _topic_words, dictionary = run_lda_lfm_tuned(
-        train, valid, test, uid2idx, sid2idx, n_topics=15
+    res, best, tuning, epoch_mse, psi, _topic_words, lda_lfm_dictionary, lda_lfm_params = run_lda_lfm_tuned(
+        train, valid, test, uid2idx, sid2idx, n_topics=15, verbose=True, n_workers=N_TUNE_WORKERS
     )
     elapsed = time.time() - t
     print(f"LDA-LFM: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  Time={elapsed:.2f}s")
+    all_preds['LDA-LFM'] = res.get('test_pred')
     write_tuning_csv(os.path.join(out_dir, 'LDA_LFM_tuning.csv'), tuning)
-    write_topics_csv(os.path.join(out_dir, 'LDA_LFM_topics.csv'), psi, dictionary)
+    write_topics_csv(os.path.join(out_dir, 'LDA_LFM_topics.csv'), psi, lda_lfm_dictionary)
     save_epoch_plot(tuning, best, os.path.join(out_dir, 'LDA_LFM_epoch_mse.png'), 'LDA-LFM')
     final_rows.append({
         'model': 'LDA-LFM',
@@ -346,63 +356,87 @@ def run_pipeline(data_path, k_core=5):
         'runtime_sec': elapsed,
     })
 
-    # -- JSTFirst -----------------------------------------------------------
-    t = time.time()
-    res, best, tuning, epoch_mse, topic_words = run_jst_first_tuned(
-        train, valid, test, uid2idx, sid2idx,
-        lexicon_path=LEXICON_PATH, K=5,
-    )
-    elapsed = time.time() - t
-    print(f"JSTFirst: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  Time={elapsed:.2f}s")
-    write_tuning_csv(os.path.join(out_dir, 'JSTFirst_tuning.csv'), tuning)
-    write_jst_topics_csv(os.path.join(out_dir, 'JSTFirst_topics.csv'), topic_words)
-    save_epoch_plot(tuning, best, os.path.join(out_dir, 'JSTFirst_epoch_mse.png'), 'JSTFirst')
-    final_rows.append({
-        'model': 'JSTFirst',
-        'best_lr': best['lr'], 'best_reg': best['reg'], 'best_mu': best['mu'],
-        'best_epochs': best['epochs'],
-        'test_mse': res['MSE'], 'test_mae': res['MAE'],
-        'runtime_sec': elapsed,
-    })
+    # # -- JSTFirst -----------------------------------------------------------
+    # t = time.time()
+    # res, best, tuning, epoch_mse, topic_words = run_jst_first_tuned(
+    #     train, valid, test, uid2idx, sid2idx,
+    #     lexicon_path=LEXICON_PATH, K=5, verbose=False,
+    # )
+    # elapsed = time.time() - t
+    # print(f"JSTFirst: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  Time={elapsed:.2f}s")
+    # all_preds['JSTFirst'] = res.get('test_pred')
+    # write_tuning_csv(os.path.join(out_dir, 'JSTFirst_tuning.csv'), tuning)
+    # write_jst_topics_csv(os.path.join(out_dir, 'JSTFirst_topics.csv'), topic_words)
+    # save_epoch_plot(tuning, best, os.path.join(out_dir, 'JSTFirst_epoch_mse.png'), 'JSTFirst')
+    # final_rows.append({
+    #     'model': 'JSTFirst',
+    #     'best_lr': best['lr'], 'best_reg': best['reg'], 'best_mu': best['mu'],
+    #     'best_epochs': best['epochs'],
+    #     'test_mse': res['MSE'], 'test_mae': res['MAE'],
+    #     'runtime_sec': elapsed,
+    # })
 
-    # -- JST-LFM ------------------------------------------------------------
-    t = time.time()
-    res, best, tuning, epoch_mse, topic_words, dictionary = run_jst_lfm_tuned(
-        train, valid, test, uid2idx, sid2idx,
-        lexicon_path=LEXICON_PATH, K=5,
-    )
-    elapsed = time.time() - t
-    print(f"JST-LFM: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  Time={elapsed:.2f}s")
-    write_tuning_csv(os.path.join(out_dir, 'JST_LFM_tuning.csv'), tuning)
-    write_jst_topics_csv(os.path.join(out_dir, 'JST_LFM_topics.csv'), topic_words)
-    save_epoch_plot(tuning, best, os.path.join(out_dir, 'JST_LFM_epoch_mse.png'), 'JST-LFM')
-    final_rows.append({
-        'model': 'JST-LFM',
-        'best_lr': best['lr'], 'best_reg': best['reg'], 'best_mu': best['mu'],
-        'best_epochs': best['epochs'],
-        'test_mse': res['MSE'], 'test_mae': res['MAE'],
-        'runtime_sec': elapsed,
-    })
+    # # -- JST-LFM ------------------------------------------------------------
+    # t = time.time()
+    # res, best, tuning, epoch_mse, topic_words, jst_lfm_dictionary, jst_lfm_params = run_jst_lfm_tuned(
+    #     train, valid, test, uid2idx, sid2idx,
+    #     lexicon_path=LEXICON_PATH, K=5, verbose=True, n_workers=N_TUNE_WORKERS,
+    # )
+    # elapsed = time.time() - t
+    # print(f"JST-LFM: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  Time={elapsed:.2f}s")
+    # all_preds['JST-LFM'] = res.get('test_pred')
+    # write_tuning_csv(os.path.join(out_dir, 'JST_LFM_tuning.csv'), tuning)
+    # write_jst_topics_csv(os.path.join(out_dir, 'JST_LFM_topics.csv'), topic_words)
+    # save_epoch_plot(tuning, best, os.path.join(out_dir, 'JST_LFM_epoch_mse.png'), 'JST-LFM')
+    # final_rows.append({
+    #     'model': 'JST-LFM',
+    #     'best_lr': best['lr'], 'best_reg': best['reg'], 'best_mu': best['mu'],
+    #     'best_epochs': best['epochs'],
+    #     'test_mse': res['MSE'], 'test_mae': res['MAE'],
+    #     'runtime_sec': elapsed,
+    # })
 
-    # -- JST-LFM asymmetric ---------------------------------------------------
-    t = time.time()
-    res, best, tuning, epoch_mse, topic_words, dictionary = run_jst_lfm_asym_tuned(
-        train, valid, test, uid2idx, sid2idx,
-        lexicon_path=LEXICON_PATH, Ks=(9, 3, 3),
-    )
-    elapsed = time.time() - t
-    print(f"JST-LFM-asym: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  Time={elapsed:.2f}s")
-    write_tuning_csv(os.path.join(out_dir, 'JST_LFM_asym_tuning.csv'), tuning)
-    write_jst_topics_csv(os.path.join(out_dir, 'JST_LFM_asym_topics.csv'), topic_words)
-    save_epoch_plot(tuning, best, os.path.join(out_dir, 'JST_LFM_asym_epoch_mse.png'), 'JST-LFM-asym')
-    final_rows.append({
-        'model': 'JST-LFM-asym',
-        'best_lr': best['lr'], 'best_reg': best['reg'], 'best_mu': best['mu'],
-        'best_epochs': best['epochs'],
-        'test_mse': res['MSE'], 'test_mae': res['MAE'],
-        'runtime_sec': elapsed,
-    })
+    # # -- JST-LFM asymmetric ---------------------------------------------------
+    # t = time.time()
+    # res, best, tuning, epoch_mse, topic_words, dictionary = run_jst_lfm_asym_tuned(
+    #     train, valid, test, uid2idx, sid2idx,
+    #     lexicon_path=LEXICON_PATH, Ks=(9, 3, 3), verbose=True, n_workers=N_TUNE_WORKERS,
+    # )
+    # elapsed = time.time() - t
+    # print(f"JST-LFM-asym: MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  Time={elapsed:.2f}s")
+    # all_preds['JST-LFM-asym'] = res.get('test_pred')
+    # write_tuning_csv(os.path.join(out_dir, 'JST_LFM_asym_tuning.csv'), tuning)
+    # write_jst_topics_csv(os.path.join(out_dir, 'JST_LFM_asym_topics.csv'), topic_words)
+    # save_epoch_plot(tuning, best, os.path.join(out_dir, 'JST_LFM_asym_epoch_mse.png'), 'JST-LFM-asym')
+    # final_rows.append({
+    #     'model': 'JST-LFM-asym',
+    #     'best_lr': best['lr'], 'best_reg': best['reg'], 'best_mu': best['mu'],
+    #     'best_epochs': best['epochs'],
+    #     'test_mse': res['MSE'], 'test_mae': res['MAE'],
+    #     'runtime_sec': elapsed,
+    # })
 
+    # # -- JST-LFM-asym 2-sentiment Ks-tuned (best of (5,5),(7,8),(9,6),(11,4),(13,2)) --
+    # t = time.time()
+    # res, best, tuning, epoch_mse, topic_words, dictionary = run_jst_lfm_asym_ks_tuned(
+    #     train, valid, test, uid2idx, sid2idx,
+    #     lexicon_path=LEXICON_PATH,
+    #     ks_list=((5, 5), (7, 8), (9, 6), (11, 4), (13, 2)),
+    #     gamma=(0.1, 1),
+    #     verbose=True, n_workers=N_TUNE_WORKERS,
+    # )
+    # elapsed = time.time() - t
+    # best_ks = best['Ks']
+    # print(f"JST-LFM-asym-2sent-Ks-tuned (Ks={best_ks}): MSE={res['MSE']:.4f}  MAE={res['MAE']:.4f}  Time={elapsed:.2f}s")
+    # all_preds['JST-LFM-asym-2sent-Ks-tuned'] = res.get('test_pred')
+    # write_jst_topics_csv(os.path.join(out_dir, 'JST_LFM_asym_2sent_Ks_tuned_topics.csv'), topic_words)
+    # final_rows.append({
+    #     'model': 'JST-LFM-asym-2sent-Ks-tuned',
+    #     'best_lr': best['lr'], 'best_reg': best['reg'], 'best_mu': best['mu'],
+    #     'best_epochs': best['epochs'],
+    #     'test_mse': res['MSE'], 'test_mae': res['MAE'],
+    #     'runtime_sec': elapsed,
+    # })
 
     # -- Write final CSV ----------------------------------------------------
     write_final_csv(os.path.join(out_dir, 'final_results.csv'), final_rows)

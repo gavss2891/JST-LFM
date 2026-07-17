@@ -10,6 +10,9 @@ A small grid search over lr, reg, and n_epochs is performed on the
 validation set; the best model is then evaluated on the test set.
 """
 
+import time as _time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 
 from data_preprocessing import load_amazon_gz, split_data
@@ -36,7 +39,7 @@ def evaluate(predictions, true_ratings):
 # ---------------------------------------------------------------------------
 def _fit_lfm(train, valid, uid2idx, sid2idx, n_factors,
              lr, reg, n_epochs=300,
-             beta1=0.9, beta2=0.999, eps=1e-8):
+             beta1=0.9, beta2=0.999, eps=1e-8, verbose=False):
     """Train LFM with Adam, evaluating val MSE every epoch. Returns best epoch's params."""
     n_users = len(uid2idx)
     n_items = len(sid2idx)
@@ -96,9 +99,10 @@ def _fit_lfm(train, valid, uid2idx, sid2idx, n_factors,
         P   = P   - lr * (adam['P']['m']   / bc1) / (np.sqrt(adam['P']['v']   / bc2) + eps)
         Q   = Q   - lr * (adam['Q']['m']   / bc1) / (np.sqrt(adam['Q']['v']   / bc2) + eps)
 
+        train_mse = float(np.mean(err ** 2))
         val_pred = predict_lfm(valid, mu, P, Q, b_u, b_i)
         val_mse = float(np.mean((val_pred - valid['overall'].values) ** 2))
-        mse_history.append((epoch + 1, val_mse))
+        mse_history.append((epoch + 1, train_mse, val_mse))
 
         if epoch >= 200:
             if val_mse < _best_vmse:
@@ -119,13 +123,26 @@ def _fit_lfm(train, valid, uid2idx, sid2idx, n_factors,
 
         _prev_vmse = val_mse
 
+        if verbose and (epoch == 0 or (epoch + 1) % 100 == 0):
+            print(f"      [LFM lr={lr} reg={reg}] epoch {epoch+1}/{n_epochs}  "
+                  f"train MSE {train_mse:.4f}  val MSE {val_mse:.4f}", flush=True)
+
     return _best_epoch, _best_vmse, _best_params, mse_history
 
 
 # ---------------------------------------------------------------------------
 # 3. Full pipeline with grid-search tuning
 # ---------------------------------------------------------------------------
-def run_lfm_tuned(train, valid, test, uid2idx, sid2idx, n_factors=10):
+def _run_combo_lfm(args):
+    lr, reg, n_epochs, train, valid, uid2idx, sid2idx, n_factors, verbose = args
+    best_ep, best_vmse, params, mse_hist = _fit_lfm(
+        train, valid, uid2idx, sid2idx, n_factors,
+        lr=lr, reg=reg, n_epochs=n_epochs, verbose=verbose,
+    )
+    return lr, reg, best_ep, best_vmse, params, mse_hist
+
+
+def run_lfm_tuned(train, valid, test, uid2idx, sid2idx, n_factors=10, verbose=False, n_workers=None):
     """Grid search over lr, reg, n_epochs on validation set, evaluate on test.
 
     Returns
@@ -135,26 +152,36 @@ def run_lfm_tuned(train, valid, test, uid2idx, sid2idx, n_factors=10):
     tuning_rows      : list of dicts (one per combo × epoch) for CSV logging
     best_mse_history : list of (epoch, val_mse) for the best combo
     """
-    lr_grid  = [0.01, 0.02]
+    lr_grid  = [0.01]
     reg_grid = [0.001]
-    n_epochs = 1000
+    n_epochs = 5000
+
+    combos = [
+        (lr, reg, n_epochs, train, valid, uid2idx, sid2idx, n_factors, verbose)
+        for lr in lr_grid for reg in reg_grid
+    ]
+    n_combos = len(combos)
 
     best_val_mse = np.inf
     best = None
     tuning_rows = []
     best_mse_history = None
 
-    print("Tuning LFM...")
-    for lr in lr_grid:
-        for reg in reg_grid:
-            best_ep, best_vmse, params, mse_hist = _fit_lfm(
-                train, valid, uid2idx, sid2idx, n_factors,
-                lr=lr, reg=reg, n_epochs=n_epochs,
-            )
-            for ep, vmse in mse_hist:
+    _n_workers = n_workers if n_workers is not None else n_combos
+    print(f"Tuning LFM ({n_combos} combos, n_workers={_n_workers})...", flush=True)
+    t_tune = _time.time()
+    with ProcessPoolExecutor(max_workers=_n_workers) as ex:
+        futures = {ex.submit(_run_combo_lfm, c): c for c in combos}
+        for i, fut in enumerate(as_completed(futures), 1):
+            lr, reg, best_ep, best_vmse, params, mse_hist = fut.result()
+            elapsed = _time.time() - t_tune
+            print(f"  [{i}/{n_combos}] lr={lr}, reg={reg}  "
+                  f"best val {best_vmse:.4f} @ epoch {best_ep}  "
+                  f"(elapsed {elapsed:.1f}s)", flush=True)
+            for ep, tmse, vmse in mse_hist:
                 tuning_rows.append({
                     'lr': lr, 'reg': reg, 'mu': float('nan'),
-                    'n_epochs': ep, 'val_mse': vmse,
+                    'n_epochs': ep, 'train_mse': tmse, 'val_mse': vmse,
                 })
             if best_vmse < best_val_mse:
                 best_val_mse = best_vmse

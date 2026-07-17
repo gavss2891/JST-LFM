@@ -1,39 +1,21 @@
 """
 JST_LFM_asymmetric.py
 
-Asymmetric variant of JST-LFM. Where the symmetric version uses K topics
-per sentiment (uniform across positive, negative, neutral), this variant
-allows the number of topics to differ across sentiments via a per-sentiment
-topic count vector Ks = (K_pos, K_neg, K_neu).
+Asymmetric variant of JST-LFM (see JST_LFM.py for the base model). Where
+the symmetric version uses K topics per sentiment, this variant allows the
+number of topics to differ across sentiments via a per-sentiment topic
+count vector Ks, stored in a flat sentiment-major layout.
 
-Motivation. Amazon review distributions are heavily skewed positive
-(mean rating ~4.2, ~70-80% positive-polarity tokens). Allocating equal
-topic capacity to each sentiment over-allocates negative/neutral topics
-relative to the data's diversity in those sentiment classes. Each global
-phi^l_k is estimated from N_l_total/K_l tokens, so a sparsely-supported
-sentiment with too many topics gets noisy phi estimates -- which then
-feeds back through the Gibbs sampler into noisy theta and ultimately
-into noisy q_{i,l}. Reducing K for sparse sentiments concentrates the
-available signal into fewer, better-estimated topic distributions.
+Prediction: mu + b_u + b_i + p_u^T q_i
 
-Default allocation in this file: Ks = (9, 3, 3), totalling D = 15
-which matches LDA-LFM at K=15 in capacity (Q dimension), enabling
-parameter-matched comparison.
-
-Implementation: Option 1 -- topic axis flattened across sentiments using
-explicit cumulative offsets. The per-sentiment topic blocks live at:
-    sentiment 0 (positive): topic cols 0           .. K_pos-1
-    sentiment 1 (negative): topic cols K_pos       .. K_pos+K_neg-1
-    sentiment 2 (neutral):  topic cols K_pos+K_neg .. D-1
-where D = sum(Ks). The Numba sweep takes flat per-sentiment arrays plus
-the offsets vector and loops over (l, k_within_l) using variable bounds.
-This is ~1.3-1.5x slower per token than the fixed-K version because the
-inner loop bounds are dynamic.
-
-Sentiment labels: 0 = positive, 1 = negative, 2 = neutral.
+Gibbs sweep: Numba-JIT sequential pass over tokens with per-sentiment
+topic counts Ks, cache=True; first call JIT-compiles.
 """
 
 import re
+import time as _time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 import numba
 from gensim import corpora
@@ -60,20 +42,20 @@ def build_corpus(train, sid2idx, n_vocab=5000):
     dictionary.filter_extremes(keep_n=n_vocab)
 
     n_items = len(sid2idx)
-    doc_words = [np.array([], dtype=np.int64) for _ in range(n_items)]
+    doc_words = [np.array([], dtype=np.int32) for _ in range(n_items)]
     seen = np.zeros(n_items, dtype=bool)
 
     for _, row in docs.iterrows():
         item_idx = sid2idx[row['asin']]
         word_ids = [dictionary.token2id[w] for w in row['tokens']
                     if w in dictionary.token2id]
-        doc_words[item_idx] = np.array(word_ids, dtype=np.int64)
+        doc_words[item_idx] = np.array(word_ids, dtype=np.int32)
         seen[item_idx] = True
 
-    n_d = np.array([len(d) for d in doc_words], dtype=np.int64)
+    n_d = np.array([len(d) for d in doc_words], dtype=np.int32)
     all_words = np.concatenate(doc_words) if n_d.sum() > 0 \
-                else np.array([], dtype=np.int64)
-    all_docs = np.repeat(np.arange(n_items, dtype=np.int64), n_d)
+                else np.array([], dtype=np.int32)
+    all_docs = np.repeat(np.arange(n_items, dtype=np.int32), n_d)
 
     print(f"Corpus: {n_items} items, {int(n_d.sum()):,} tokens, "
           f"vocab {len(dictionary)}, "
@@ -89,7 +71,8 @@ def load_mpqa_lexicon(path, dictionary, min_freq=20):
     """
     Parse an MPQA-format .tff file and return {word_id: sentiment_label}
     for vocabulary words with corpus frequency >= min_freq.
-    Labels: 0 = positive, 1 = negative. Neutral and conflicting polarities
+    Labels: 0 = positive, 2 = negative (sentiment index 1 is neutral and
+    is never seeded from the lexicon). Neutral and conflicting polarities
     are skipped.
     """
     kv = re.compile(r'(\w+)=([^\s]+)')
@@ -116,7 +99,7 @@ def load_mpqa_lexicon(path, dictionary, min_freq=20):
         if dictionary.dfs.get(wid, 0) < min_freq:
             continue
         polarity = next(iter(polarities))
-        lexicon[wid] = 0 if polarity == 'positive' else 1
+        lexicon[wid] = 0 if polarity == 'positive' else 2
 
     return lexicon
 
@@ -212,23 +195,16 @@ def _jst_lfm_asym_sweep(all_words, all_docs,
                         N_kI, N_kw, N_k, N_lI,
                         all_topics_flat, all_sents):
     """
-    One sequential sweep with per-sentiment topic counts Ks.
-
-    For each token j (with d = all_docs[j], w = all_words[j]):
-        For each (l, k_in_l) with k_in_l in [0, K_l):
-            kf = offsets[l] + k_in_l   # flat index
-            probs[kf] = pi_d[d, l] * theta_flat[d, kf] * phi_flat[kf, w]
-        Sample kf_new from Multinomial(probs / sum probs) via inverse CDF.
-        Decode l_new = sentiment corresponding to kf_new (via offsets).
-        Update counts at kf_new.
-        Accumulate lk and grad_kappa using flat index.
+    One sequential Gibbs sweep with per-sentiment topic counts Ks: for each
+    token, samples a flat (sentiment, topic) index via inverse-CDF over
+    pi_d * theta_flat * phi_flat, decodes its sentiment from the offsets,
+    updates the count matrices in place, and accumulates the corpus
+    log-likelihood and kappa gradient.
 
     theta_flat : (n_items, D) sentiment-major-blocked softmax over Q
     phi_flat   : (D, V) per-(sentiment,topic) word distribution
     Q_flat     : (n_items, D) flat factor matrix (matches Q)
     eq_block   : (n_items, S) E_theta[q] within each sentiment block
-
-    Modifies in place: N_kI, N_kw, N_k, N_lI, all_topics_flat, all_sents.
     """
     N_total = all_words.shape[0]
     probs = np.empty(D, dtype=np.float64)
@@ -332,8 +308,8 @@ def top_words_per_topic_sentiment(psi_flat, Ks, offsets, dictionary, top_n=10):
 # ---------------------------------------------------------------------------
 def fit_jst_lfm_asym(train, valid, all_words, all_docs, n_d, seen,
                      lexicon, uid2idx, sid2idx,
-                     n_vocab, Ks=(9, 3, 3),
-                     alpha=5.0, beta=0.01, gamma=(0.1, 1, 10),
+                     n_vocab, Ks=(9, 3, 3), k_star=0,
+                     alpha=5.0, beta=0.01, gamma=(0.1, 10, 1),
                      lr=0.005, reg=0.02, mu_corpus=1.0, kappa_init=1.0,
                      beta1=0.9, beta2=0.99, eps=1e-8,
                      n_epochs=300, seed=42, verbose=False):
@@ -342,18 +318,27 @@ def fit_jst_lfm_asym(train, valid, all_words, all_docs, n_d, seen,
     Evaluates val MSE every epoch; keeps only the best epoch's params.
 
     Ks : tuple of S ints, one per sentiment label.
+         Sentiment order: index 0 = positive, 1 = neutral, 2 = negative.
          Default (9, 3, 3) gives D = 15 to capacity-match LDA-LFM(K=15).
 
-    The factor matrix Q has shape (n_items, D = sum(Ks)). Rating prediction
-    uses the full inner product over all D dimensions. The topic model
-    operates in S separate softmax blocks of size K_l each, joined into the
-    flat sentiment-major layout described at the top of this module.
+    k_star : int, default 0
+        Number of extra rating-only latent dimensions appended to Q and P.
+        Cols 0..D-1 (where D = sum(Ks)) are topic-linked (corpus gradient,
+        no lambda reg). Cols D..D+k_star-1 are rating-only (rating gradient
+        + lambda reg, never enter the Gibbs sweep).
+        k_star=0 reproduces the base model exactly.
+
+    The factor matrix Q has shape (n_items, D + k_star). Rating prediction
+    uses the full inner product over all D + k_star dimensions. The topic
+    model operates in S separate softmax blocks of size K_l each, joined
+    into the flat sentiment-major layout described at the top of this module.
     """
     import time as _time
 
     Ks = np.asarray(Ks, dtype=np.int64)
     S = len(Ks)
     D = int(Ks.sum())
+    Dfull = D + k_star               # full factor dimensionality
     offsets = np.concatenate([[0], np.cumsum(Ks)]).astype(np.int64)  # (S+1,)
 
     n_users = len(uid2idx)
@@ -367,22 +352,22 @@ def fit_jst_lfm_asym(train, valid, all_words, all_docs, n_d, seen,
     rng = np.random.RandomState(seed)
     mu = train['overall'].mean()
 
-    # --- Parameters ---
-    # Q, P flat (n_*, D), sentiment-major blocked layout.
-    Q   = rng.normal(0, 0.01, (n_items, D)).astype(np.float64)
-    P   = rng.normal(0, 0.01, (n_users, D)).astype(np.float64)
+    # --- Parameters: full dimensionality Dfull = D + k_star ---
+    # Q, P flat (n_*, Dfull), sentiment-major blocked layout + optional extra block.
+    Q   = rng.normal(0, 0.01, (n_items, Dfull)).astype(np.float64)
+    P   = rng.normal(0, 0.01, (n_users, Dfull)).astype(np.float64)
     b_u = np.zeros(n_users, dtype=np.float64)
     b_i = np.zeros(n_items, dtype=np.float64)
-    psi = rng.normal(0, 0.01, (D, n_vocab)).astype(np.float64)
+    psi = rng.normal(0, 0.01, (D, n_vocab)).astype(np.float64)   # topic block only
     kappa = float(kappa_init)
 
     # --- Gibbs assignments: random topic-within-sentiment + lexicon-seeded l ---
     N_total = int(all_words.shape[0])
-    all_sents = rng.randint(0, S, size=N_total).astype(np.int64)
+    all_sents = rng.randint(0, S, size=N_total).astype(np.int32)
     if lexicon:
         lex_ids = np.fromiter(lexicon.keys(), dtype=np.int64)
         lex_labels = np.fromiter(lexicon.values(), dtype=np.int64)
-        lookup = -np.ones(n_vocab, dtype=np.int64)
+        lookup = -np.ones(n_vocab, dtype=np.int32)
         lookup[lex_ids] = lex_labels
         seeded = lookup[all_words]
         mask = seeded >= 0
@@ -390,7 +375,7 @@ def fit_jst_lfm_asym(train, valid, all_words, all_docs, n_d, seen,
 
     # Random topic within each token's assigned sentiment block, then convert
     # to the flat sentiment-major index.
-    all_topics_flat = np.empty(N_total, dtype=np.int64)
+    all_topics_flat = np.empty(N_total, dtype=np.int32)
     for l in range(S):
         mask_l = (all_sents == l)
         n_l = int(mask_l.sum())
@@ -404,7 +389,7 @@ def fit_jst_lfm_asym(train, valid, all_words, all_docs, n_d, seen,
         n_items, n_vocab, Ks, offsets,
     )
 
-    # --- Adam state ---
+    # --- Adam state (sized to Dfull for Q and P) ---
     adam = {name: {'m': np.zeros_like(param), 'v': np.zeros_like(param)}
             for name, param in [('Q', Q), ('P', P), ('b_u', b_u),
                                 ('b_i', b_i), ('psi', psi)]}
@@ -432,47 +417,51 @@ def fit_jst_lfm_asym(train, valid, all_words, all_docs, n_d, seen,
         N_d_vec = N_lI.sum(axis=1)                                  # (n_items,)
         pi_d = (N_lI + gamma_arr[None, :]) / (N_d_vec[:, None] + gamma_sum)
 
-        # (B) theta and phi from current Q, psi (per-sentiment softmax blocks)
-        theta_flat = softmax_per_sentiment_block(kappa * Q, Ks, offsets)  # (n_items, D)
-        phi_flat   = softmax(psi, axis=1)                                 # (D, V)
+        # (B) theta and phi from the TOPIC-LINKED block of Q only (first D cols)
+        Q_topic    = Q[:, :D]                                            # (n_items, D)
+        theta_flat = softmax_per_sentiment_block(kappa * Q_topic, Ks, offsets)
+        phi_flat   = softmax(psi, axis=1)                               # (D, V)
 
-        # eq_block[i, l] = sum_{k in block l} theta[i, kf] * Q[i, kf]
+        # eq_block[i, l] = sum_{k in block l} theta[i, kf] * Q_topic[i, kf]
         eq_block = np.zeros((n_items, S), dtype=np.float64)
         for l in range(S):
             sl = slice(offsets[l], offsets[l + 1])
-            eq_block[:, l] = np.sum(theta_flat[:, sl] * Q[:, sl], axis=1)
+            eq_block[:, l] = np.sum(theta_flat[:, sl] * Q_topic[:, sl], axis=1)
 
-        # (C) Zero counts; Numba sweep resamples all tokens
+        # (C) Zero counts; Numba sweep resamples all tokens.
+        #     Pass contiguous copies of the D-column topic views so Numba
+        #     sees C-contiguous arrays.
         N_kI.fill(0.0); N_kw.fill(0.0); N_k.fill(0.0); N_lI.fill(0.0)
         rand_uniforms = rng.random_sample(N_total)
+        theta_c   = np.ascontiguousarray(theta_flat)
+        Q_topic_c = np.ascontiguousarray(Q_topic)
         lk, grad_kappa_corpus = _jst_lfm_asym_sweep(
             all_words, all_docs,
-            theta_flat, phi_flat, pi_d, Q, eq_block,
+            theta_c, phi_flat, pi_d, Q_topic_c, eq_block,
             Ks, offsets, D,
             rand_uniforms,
             N_kI, N_kw, N_k, N_lI,
             all_topics_flat, all_sents,
         )
 
-        # (D) Corpus gradients from counts
+        # (D) Corpus gradients from counts (topic-linked block only)
         # grad_q[i, kf]  = kappa * (N_kI[i, kf] - N_lI[i, l(kf)] * theta_flat[i, kf])
         # grad_psi[kf, w] = N_kw[kf, w] - N_k[kf] * phi_flat[kf, w]
-        grad_q_corpus = np.empty_like(Q)
+        grad_q_corpus = np.empty((n_items, D), dtype=np.float64)
         for l in range(S):
             sl = slice(offsets[l], offsets[l + 1])
-            # Broadcast N_lI[:, l] over the K_l columns of this sentiment's block
             grad_q_corpus[:, sl] = kappa * (
                 N_kI[:, sl] - N_lI[:, l:l + 1] * theta_flat[:, sl]
             )
         grad_psi_corpus = N_kw - N_k[:, None] * phi_flat                  # (D, V)
 
-        # (E) Rating gradients
+        # (E) Rating gradients over the FULL Dfull dimensions
         pred = predict_ratings(train, mu, P, Q, b_u, b_i)
         err = pred - ratings
         err_2 = 2 * err / n_ratings
 
-        grad_P        = np.zeros_like(P)
-        grad_Q_rating = np.zeros_like(Q)
+        grad_P        = np.zeros_like(P)            # (n_users, Dfull)
+        grad_Q_rating = np.zeros_like(Q)            # (n_items, Dfull)
         grad_bu       = np.zeros_like(b_u)
         grad_bi       = np.zeros_like(b_i)
 
@@ -483,13 +472,21 @@ def fit_jst_lfm_asym(train, valid, all_words, all_docs, n_d, seen,
 
         grad_bu += 2 * reg * b_u
         grad_bi += 2 * reg * b_i
-        grad_P  += 2 * reg * P
-        # Q is NOT regularised by lambda; the corpus term plays that role.
+        grad_P  += 2 * reg * P                      # all Dfull dims of P regularised
+        # Topic-linked block of Q is NOT regularised by lambda; the corpus term
+        # plays that role. Extra block is regularised below.
 
-        # (F) Combine (corpus normalised by total_words; mu_corpus ~1 neutral)
-        grad_Q     = grad_Q_rating - mu_corpus * grad_q_corpus     / total_words
-        grad_psi   =                - mu_corpus * grad_psi_corpus  / total_words
-        grad_kappa =                - mu_corpus * grad_kappa_corpus / total_words
+        # (F) Assemble the full Q gradient.
+        #     - Topic-linked block (first D cols): rating grad + corpus grad,
+        #       NOT lambda-regularised (corpus term plays that role).
+        #     - Extra block (last k_star cols): rating grad + lambda, NO corpus.
+        grad_Q = grad_Q_rating.copy()                               # (n_items, Dfull)
+        grad_Q[:, :D] -= mu_corpus * grad_q_corpus / total_words
+        if k_star > 0:
+            grad_Q[:, D:] += 2 * reg * Q[:, D:]
+
+        grad_psi   = - mu_corpus * grad_psi_corpus   / total_words
+        grad_kappa = - mu_corpus * grad_kappa_corpus / total_words
 
         # (G) Adam updates with bias correction
         t = epoch + 1
@@ -512,50 +509,133 @@ def fit_jst_lfm_asym(train, valid, all_words, all_docs, n_d, seen,
         kappa = kappa - lr * (adam['kappa']['m'] / bc1) / (np.sqrt(adam['kappa']['v'] / bc2) + eps)
 
         # (H) Validation evaluation; keep best params
+        train_mse = float(np.mean(err ** 2))
         val_pred = predict_ratings(valid, mu, P, Q, b_u, b_i)
         val_mse = float(np.mean((val_pred - valid['overall'].values) ** 2))
-        mse_history.append((epoch + 1, val_mse))
+        mse_history.append((epoch + 1, train_mse, val_mse))
 
-        if abs(val_mse - _prev_vmse) < 1e-6:
-            _loss_diff_counter += 1
-            if _loss_diff_counter >= 10:
-                break
-        else:
-            _loss_diff_counter = 0
+        if epoch >= 1:
+            if abs(val_mse - _prev_vmse) < 1e-6:
+                _loss_diff_counter += 1
+                if _loss_diff_counter >= 10:
+                    break
+            else:
+                _loss_diff_counter = 0
 
-        if val_mse < _best_vmse:
-            _best_vmse = val_mse
-            _best_epoch = epoch + 1
-            _best_params = (mu, P.copy(), Q.copy(), b_u.copy(), b_i.copy(),
-                            psi.copy(), float(kappa))
-            _patience_counter = 0
-        else:
-            _patience_counter += 1
-            if _patience_counter >= 100:
-                break
+            if val_mse < _best_vmse:
+                _best_vmse = val_mse
+                _best_epoch = epoch + 1
+                _best_params = (mu, P.copy(), Q.copy(), b_u.copy(), b_i.copy(),
+                                psi.copy(), float(kappa))
+                _patience_counter = 0
+            else:
+                _patience_counter += 1
+                if _patience_counter >= 300:
+                    break
 
         _prev_vmse = val_mse
 
-        if verbose:
+        if verbose and (epoch == 0 or (epoch + 1) % 10 == 0):
             dt = _time.time() - t_epoch
-            train_mse = float(np.mean(err ** 2))
-            print(f"      epoch {epoch+1}/{n_epochs}  "
-                  f"train MSE {train_mse:.4f}  "
-                  f"kappa {kappa:+.3f}  "
-                  f"lk {lk:.1f}  "
-                  f"dt {dt:.2f}s", flush=True)
+            kstar_str = f" K*={k_star}" if k_star > 0 else ""
+            print(f"      [JST-LFM-asym{kstar_str} lr={lr} reg={reg} mu={mu_corpus}] epoch {epoch+1}/{n_epochs}  "
+                  f"train MSE {train_mse:.4f}  val MSE {val_mse:.4f}  "
+                  f"kappa {kappa:+.3f}  lk {lk:.1f}  dt {dt:.2f}s", flush=True)
 
     return _best_epoch, _best_vmse, _best_params, mse_history
 
 
 # ---------------------------------------------------------------------------
-# 9. Full pipeline with grid-search tuning
+# 9. Single-configuration runner (fixed Ks, fixed hyperparameters, one k_star)
 # ---------------------------------------------------------------------------
+def run_jst_lfm_asym_kstar(train, valid, test, uid2idx, sid2idx,
+                           lr, reg, mu_corpus,
+                           Ks=(9, 3, 3), k_star=0,
+                           lexicon_path='MPQA_Subjectivity_Lexicon.tff',
+                           n_vocab=5000, alpha=5.0, beta=0.01, gamma=(0.1, 10, 1),
+                           min_freq=20, n_epochs=5000, seed=42,
+                           corpus=None, lexicon=None, dictionary=None,
+                           verbose=False):
+    """
+    Train asymmetric JST-LFM with k_star extra features at fixed Ks and
+    fixed (lr, reg, mu_corpus); evaluate on the test set.
+
+    For the K* sweep, Ks should be the best allocation chosen for the dataset
+    and (lr, reg, mu_corpus) the values selected at k_star = 0. The corpus,
+    lexicon, and dictionary can be built once and passed in to avoid
+    rebuilding them for every K*.
+
+    `corpus`, if provided, is the tuple
+    (all_words, all_docs, n_d, seen) returned by build_corpus (last 4 items).
+
+    Returns
+    -------
+    results     : dict with MSE, MAE, test_pred
+    best_info   : dict with lr, reg, mu, Ks, k_star, epochs, val_mse
+    mse_history : list of (epoch, train_mse, val_mse)
+    topic_words : dict {(k_in_l, l): [(word, prob), ...]} from the best model
+    """
+    if corpus is None or lexicon is None or dictionary is None:
+        print(f"Building corpus (asymmetric Ks={tuple(Ks)})...")
+        doc_words, dictionary, all_words, all_docs, n_d, seen = \
+            build_corpus(train, sid2idx, n_vocab)
+        lexicon = load_mpqa_lexicon(lexicon_path, dictionary, min_freq=min_freq)
+    else:
+        all_words, all_docs, n_d, seen = corpus
+    actual_n_vocab = len(dictionary)
+
+    Ks_arr = np.asarray(Ks, dtype=np.int64)
+    offsets = np.concatenate([[0], np.cumsum(Ks_arr)]).astype(np.int64)
+
+    best_ep, best_vmse, params, mse_hist = fit_jst_lfm_asym(
+        train, valid, all_words, all_docs, n_d, seen,
+        lexicon, uid2idx, sid2idx,
+        n_vocab=actual_n_vocab, Ks=Ks, k_star=k_star,
+        alpha=alpha, beta=beta, gamma=gamma,
+        lr=lr, reg=reg, mu_corpus=mu_corpus,
+        n_epochs=n_epochs, seed=seed, verbose=verbose,
+    )
+
+    mu, P, Q, b_u, b_i, psi, kappa = params
+    test_pred = predict_ratings(test, mu, P, Q, b_u, b_i)
+    results = evaluate(test_pred, test['overall'].values)
+    results['test_pred'] = test_pred
+
+    best_info = {'lr': lr, 'reg': reg, 'mu': mu_corpus, 'Ks': tuple(Ks),
+                 'k_star': k_star, 'epochs': best_ep, 'val_mse': best_vmse}
+    topic_words = top_words_per_topic_sentiment(
+        psi, Ks_arr, offsets, dictionary, top_n=10
+    )
+
+    print(f"  JST-LFM-asym Ks={tuple(Ks)} K*={k_star}: val MSE={best_vmse:.4f} "
+          f"@ epoch {best_ep}, test MSE={results['MSE']:.4f}")
+
+    return results, best_info, mse_hist, topic_words
+
+
+# ---------------------------------------------------------------------------
+# 10. Full pipeline with grid-search tuning
+# ---------------------------------------------------------------------------
+def _run_combo_jst_lfm_asym(args):
+    (lr, reg, mu_c, train, valid, all_words, all_docs, n_d, seen,
+     lexicon, uid2idx, sid2idx, n_vocab, Ks, alpha, beta, gamma,
+     n_epochs, seed, verbose) = args
+    best_ep, best_vmse, params, mse_hist = fit_jst_lfm_asym(
+        train, valid, all_words, all_docs, n_d, seen,
+        lexicon, uid2idx, sid2idx,
+        n_vocab=n_vocab, Ks=Ks, alpha=alpha, beta=beta, gamma=gamma,
+        lr=lr, reg=reg, mu_corpus=mu_c,
+        n_epochs=n_epochs, seed=seed, verbose=verbose,
+    )
+    return lr, reg, mu_c, best_ep, best_vmse, params, mse_hist
+
+
 def run_jst_lfm_asym_tuned(train, valid, test, uid2idx, sid2idx,
                            lexicon_path='MPQA_Subjectivity_Lexicon.tff',
                            Ks=(9, 3, 3), n_vocab=5000,
-                           alpha=5.0, beta=0.01, gamma=(0.1, 1, 10),
-                           min_freq=20, seed=42):
+                           alpha=5.0, beta=0.01, gamma=(0.1, 10, 1),
+                           min_freq=20, seed=42, verbose=False,
+                           n_workers=None, mu_grid=None):
     """
     Build corpus once, load MPQA lexicon once, then grid-search
     (lr, reg, mu_corpus) × checkpoint epochs on validation. Evaluate the
@@ -571,8 +651,6 @@ def run_jst_lfm_asym_tuned(train, valid, test, uid2idx, sid2idx,
     topic_words : dict {(k_in_l, l): [(word, prob), ...]} from best model's psi
     dictionary  : gensim Dictionary
     """
-    import time as _time
-
     print(f"Building corpus (asymmetric Ks={tuple(Ks)})...")
     doc_words, dictionary, all_words, all_docs, n_d, seen = \
         build_corpus(train, sid2idx, n_vocab)
@@ -585,55 +663,56 @@ def run_jst_lfm_asym_tuned(train, valid, test, uid2idx, sid2idx,
     S = len(Ks_arr)
     D = int(Ks_arr.sum())
     offsets = np.concatenate([[0], np.cumsum(Ks_arr)]).astype(np.int64)
-    print(f"  Per-sentiment topic counts: K_pos={Ks[0]}, K_neg={Ks[1]}, K_neu={Ks[2]}")
+    sent_names = ['K_pos', 'K_neu', 'K_neg']
+    sent_str = ', '.join(f'{sent_names[l] if l < len(sent_names) else f"K_s{l}"}={Ks[l]}' for l in range(S))
+    print(f"  Per-sentiment topic counts: {sent_str}")
     print(f"  Total Q dim D = {D}, sentiment-major offsets = {tuple(offsets.tolist())}")
 
-    lr_grid  = [0.01, 0.02]
+    lr_grid  = [0.01]
     reg_grid = [0.001]
-    mu_grid  = [300.0, 600.0]
-    n_epochs = 1000
+    if mu_grid is None:
+        mu_grid = [1, 3, 5, 10, 30, 50, 100, 300, 500, 1000]
+    n_epochs = 5000
 
-    n_combos = len(lr_grid) * len(reg_grid) * len(mu_grid)
-    print(f"Tuning JST-LFM-asym ({n_combos} combos × {n_epochs} epochs; "
-          f"first combo JIT-compiles, ~10-15s)...", flush=True)
-    t_tune = _time.time()
-    combo_idx = 0
+    combos = sorted([
+        (lr, reg, mu_c, train, valid, all_words, all_docs, n_d, seen,
+         lexicon, uid2idx, sid2idx, actual_n_vocab,
+         Ks, alpha, beta, gamma, n_epochs, seed, verbose)
+        for lr in lr_grid for reg in reg_grid for mu_c in mu_grid
+    ], key=lambda c: -c[2])
+    n_combos = len(combos)
 
     best_val_mse = np.inf
     best = None
     tuning_rows = []
     best_mse_history = None
 
-    for lr in lr_grid:
-        for reg in reg_grid:
-            for mu_c in mu_grid:
-                combo_idx += 1
-                t_combo = _time.time()
-                best_ep, best_vmse, params, mse_hist = fit_jst_lfm_asym(
-                    train, valid, all_words, all_docs, n_d, seen,
-                    lexicon, uid2idx, sid2idx,
-                    n_vocab=actual_n_vocab,
-                    Ks=Ks, alpha=alpha, beta=beta, gamma=gamma,
-                    lr=lr, reg=reg, mu_corpus=mu_c,
-                    n_epochs=n_epochs, seed=seed, verbose=False,
-                )
-
-                for ep, vmse in mse_hist:
+    _n_workers = n_workers if n_workers is not None else n_combos
+    print(f"Tuning JST-LFM-asym ({n_combos} combos, n_workers={_n_workers}; "
+          f"Numba cache=True, JIT on first run only)...", flush=True)
+    t_tune = _time.time()
+    i = 0
+    # Submit in batches of _n_workers to avoid pickling all combos simultaneously.
+    with ProcessPoolExecutor(max_workers=_n_workers) as ex:
+        for batch_start in range(0, n_combos, _n_workers):
+            batch = combos[batch_start:batch_start + _n_workers]
+            futures = {ex.submit(_run_combo_jst_lfm_asym, c): c for c in batch}
+            for fut in as_completed(futures):
+                i += 1
+                lr, reg, mu_c, best_ep, best_vmse, params, mse_hist = fut.result()
+                elapsed = _time.time() - t_tune
+                print(f"  [{i}/{n_combos}] lr={lr}, reg={reg}, mu={mu_c}  "
+                      f"best val {best_vmse:.4f} @ epoch {best_ep}  "
+                      f"(elapsed {elapsed:.1f}s)", flush=True)
+                for ep, tmse, vmse in mse_hist:
                     tuning_rows.append({
                         'lr': lr, 'reg': reg, 'mu': mu_c,
-                        'n_epochs': ep, 'val_mse': vmse,
+                        'n_epochs': ep, 'train_mse': tmse, 'val_mse': vmse,
                     })
                 if best_vmse < best_val_mse:
                     best_val_mse = best_vmse
                     best = (lr, reg, mu_c, best_ep, params)
                     best_mse_history = mse_hist
-
-                dt_combo = _time.time() - t_combo
-                elapsed  = _time.time() - t_tune
-                print(f"  [{combo_idx}/{n_combos}] lr={lr}, reg={reg}, mu={mu_c}  "
-                      f"best val {best_vmse:.4f} @ epoch {best_ep}  "
-                      f"(combo {dt_combo:.1f}s, elapsed {elapsed:.1f}s)",
-                      flush=True)
 
     lr, reg, mu_c, n_ep, params = best
     print(f"\n  Best JST-LFM-asym Ks={tuple(Ks)}: lr={lr}, reg={reg}, "
@@ -651,6 +730,114 @@ def run_jst_lfm_asym_tuned(train, valid, test, uid2idx, sid2idx,
     )
 
     return results, best_info, tuning_rows, best_mse_history, topic_words, dictionary
+
+
+# ---------------------------------------------------------------------------
+# 10. Ks-search: try multiple (K_pos, K_neg) allocations, pick best by val MSE
+# ---------------------------------------------------------------------------
+def run_jst_lfm_asym_ks_tuned(train, valid, test, uid2idx, sid2idx,
+                                  lexicon_path='MPQA_Subjectivity_Lexicon.tff',
+                                  ks_list=((5, 5), (7, 8), (9, 6), (11, 4), (13, 2)),
+                                  n_vocab=5000,
+                                  alpha=5.0, beta=0.01, gamma=(0.1, 1),
+                                  min_freq=20, seed=42, verbose=False,
+                                  n_workers=None, mu_grid=None):
+    """
+    2-sentiment JST-LFM-asym with Ks search. Builds corpus once, then for
+    each (K_pos, K_neg) in ks_list runs the full mu-grid tuning and tracks
+    the best validation MSE. The (Ks, mu) combination with the lowest
+    validation MSE is used to evaluate on the test set.
+
+    Returns same signature as run_jst_lfm_asym_tuned, with best_info['Ks']
+    recording the winning allocation.
+    """
+    print("Building corpus (2-sentiment Ks sweep)...")
+    doc_words, dictionary, all_words, all_docs, n_d, seen = \
+        build_corpus(train, sid2idx, n_vocab)
+    actual_n_vocab = len(dictionary)
+
+    lexicon = load_mpqa_lexicon(lexicon_path, dictionary, min_freq=min_freq)
+    print(f"Lexicon: {len(lexicon):,} sentiment-tagged words (positive/negative)")
+
+    lr_grid = [0.01]
+    reg_grid = [0.001]
+    if mu_grid is None:
+        mu_grid = [1, 3, 5, 10, 30, 50, 100, 300, 500, 1000]
+    n_epochs = 5000
+
+    overall_best_val = np.inf
+    overall_best = None       # (lr, reg, mu_c, n_ep, params)
+    overall_best_Ks = None
+    all_tuning_rows = []
+    overall_best_mse_hist = None
+
+    for Ks in ks_list:
+        Ks_arr = np.asarray(Ks, dtype=np.int64)
+        D = int(Ks_arr.sum())
+        print(f"\n  Trying Ks={Ks} (K_pos={Ks[0]}, K_neg={Ks[1]}, D={D})...", flush=True)
+
+        combos = sorted([
+            (lr, reg, mu_c, train, valid, all_words, all_docs, n_d, seen,
+             lexicon, uid2idx, sid2idx, actual_n_vocab,
+             Ks, alpha, beta, gamma, n_epochs, seed, verbose)
+            for lr in lr_grid for reg in reg_grid for mu_c in mu_grid
+        ], key=lambda c: -c[2])
+        n_combos = len(combos)
+
+        w = n_workers if n_workers is not None else n_combos
+        print(f"  Tuning {n_combos} combos (n_workers={w})...", flush=True)
+        t_tune = _time.time()
+        i = 0
+        ks_best_val = np.inf
+        ks_best = None
+        ks_best_mse_hist = None
+
+        with ProcessPoolExecutor(max_workers=w) as ex:
+            for batch_start in range(0, n_combos, w):
+                batch = combos[batch_start:batch_start + w]
+                futures = {ex.submit(_run_combo_jst_lfm_asym, c): c for c in batch}
+                for fut in as_completed(futures):
+                    i += 1
+                    lr, reg, mu_c, best_ep, best_vmse, params, mse_hist = fut.result()
+                    elapsed = _time.time() - t_tune
+                    print(f"    [{i}/{n_combos}] Ks={Ks} lr={lr}, reg={reg}, mu={mu_c}  "
+                          f"best val {best_vmse:.4f} @ epoch {best_ep}  "
+                          f"(elapsed {elapsed:.1f}s)", flush=True)
+                    for ep, tmse, vmse in mse_hist:
+                        all_tuning_rows.append({
+                            'lr': lr, 'reg': reg, 'mu': mu_c,
+                            'n_epochs': ep, 'train_mse': tmse, 'val_mse': vmse,
+                        })
+                    if best_vmse < ks_best_val:
+                        ks_best_val = best_vmse
+                        ks_best = (lr, reg, mu_c, best_ep, params)
+                        ks_best_mse_hist = mse_hist
+
+        print(f"  Ks={Ks}: best val MSE = {ks_best_val:.4f}", flush=True)
+        if ks_best_val < overall_best_val:
+            overall_best_val = ks_best_val
+            overall_best = ks_best
+            overall_best_Ks = Ks
+            overall_best_mse_hist = ks_best_mse_hist
+
+    print(f"\n  Best: Ks={overall_best_Ks}, val MSE={overall_best_val:.4f}")
+
+    lr, reg, mu_c, n_ep, params = overall_best
+    Ks_arr = np.asarray(overall_best_Ks, dtype=np.int64)
+    offsets = np.concatenate([[0], np.cumsum(Ks_arr)]).astype(np.int64)
+
+    mu, P, Q, b_u, b_i, psi, kappa = params
+    test_pred = predict_ratings(test, mu, P, Q, b_u, b_i)
+    results = evaluate(test_pred, test['overall'].values)
+    results['test_pred'] = test_pred
+    best_info = {'lr': lr, 'reg': reg, 'mu': mu_c, 'epochs': n_ep,
+                 'Ks': tuple(overall_best_Ks)}
+
+    topic_words = top_words_per_topic_sentiment(
+        psi, Ks_arr, offsets, dictionary, top_n=10
+    )
+
+    return results, best_info, all_tuning_rows, overall_best_mse_hist, topic_words, dictionary
 
 
 # ---------------------------------------------------------------------------

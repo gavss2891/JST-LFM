@@ -1,31 +1,28 @@
 """
 JSTFirst.py
 
-JSTFirst baseline: run the Joint Sentiment/Topic model on the review corpus
-to obtain sentiment-specific topic distributions theta_{d,k,l}, then flatten
-these to a fixed S*K-dimensional item feature vector and use them as fixed
-item factors in a latent factor model. Only user factors P and biases are
-learned.
+JSTFirst baseline: runs the Joint Sentiment/Topic model on the review
+corpus to obtain sentiment-specific topic distributions theta_{d,k,l}, then
+flattens these to a fixed item feature vector used as fixed item factors in
+a latent factor model. Only user factors P and biases are learned; JST and
+the rating model are NOT jointly optimised. JST runs once (seeded with the
+MPQA subjectivity lexicon), then its output is fed into the rating model as
+fixed features.
 
-Prediction:  mu + b_u + b_i + p_u^T theta_flat_i
-
-Unlike JST-LFM, the JST model and the rating model are NOT jointly optimised.
-JST runs once (seeded with the MPQA subjectivity lexicon), then its output
-is fed into the rating model as fixed features.
+Prediction: mu + b_u + b_i + p_u^T theta_flat_i
 
 Tuning mirrors LDAFirst: JST is built once, then the LFM second stage is
-grid-searched over lr, reg, and n_epochs using the epoch-checkpoint trick
-(train once to max(epochs), snapshot val MSE at each checkpoint).
+grid-searched over lr, reg, and n_epochs using the epoch-checkpoint trick.
 
-Gibbs sampler implementation: sequential collapsed Gibbs (Lin & He 2009,
-Eq. 5) with per-token exclusion, JIT-compiled via Numba. Faster than
-vectorised batch Gibbs on large corpora (>1M tokens) because per-token
-work fits in L1 cache and there are no O(N_total * K * S) intermediate
-allocations. First call pays ~5-10s JIT compile cost; subsequent calls
-run at compiled speed.
+Gibbs sampler: sequential collapsed Gibbs (Lin & He 2009, Eq. 5) with
+per-token exclusion, JIT-compiled via Numba; first call JIT-compiles
+(~5-10s).
 """
 
 import re
+import time as _time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 import numba
 from gensim import corpora
@@ -128,17 +125,12 @@ def _gibbs_sweep(all_words, all_docs, all_topics, all_sents,
                  K, S, V, alpha, beta, gamma_arr, gamma_sum,
                  rand_uniforms):
     """
-    One full Gibbs sweep over all tokens.
-
-    For each token t, implements Lin (2009) Eq. 5 with per-token exclusion:
-        P(z_t=k, l_t=l | rest) propto
-            (N_{w_t,k,l}^{-t} + beta) / (N_{k,l}^{-t} + V*beta)
-          * (N_{k,l,d}^{-t} + alpha) / (N_{l,d}^{-t} + K*alpha)
-          * (N_{l,d}^{-t} + gamma_l) / (N_d^{-t} + sum_gamma)
-
-    Counts are updated incrementally: decrement, sample, increment. All
-    count buffers are modified in place. Seeded lexicon tokens are still
-    resampled here — the lexicon only biases initialisation.
+    One full Gibbs sweep over all tokens: for each token, decrements its
+    current assignment, resamples (topic, sentiment) jointly from the
+    collapsed posterior (Lin & He 2009, Eq. 5) via inverse-CDF, then
+    increments the new assignment. Count buffers are modified in place.
+    Lexicon-seeded tokens are still resampled here — the lexicon only
+    biases initialisation.
     """
     N_total = all_words.shape[0]
     prob = np.empty(K * S, dtype=np.float64)
@@ -202,12 +194,11 @@ def run_jst_gibbs(all_words, all_docs, n_items, n_vocab, lexicon,
                   gamma=(0.01, 5.0, 1.0), n_iter=500, seed=42):
     """
     Sequential collapsed Gibbs sampler for JST (Lin & He 2009), JIT-compiled
-    via Numba. Counts are maintained incrementally with per-token exclusion,
-    faithful to Eq. 5 of the paper.
+    via Numba.
 
-    Sentiment labels:  0 = positive, 1 = negative, 2 = neutral.
-    Lexicon seeds positive/negative words at initialisation; all others
-    (and every topic assignment) are initialised uniformly at random.
+    Sentiment labels: 0 = positive, 1 = negative, 2 = neutral. Lexicon seeds
+    positive/negative words at initialisation; all others (and every topic
+    assignment) are initialised uniformly at random.
 
     Returns
     -------
@@ -318,10 +309,19 @@ def extract_jst_features(all_topics, all_sents, all_docs, n_items,
 # ---------------------------------------------------------------------------
 # 6. LFM second stage: train with fixed item features, vectorised batch Adam
 # ---------------------------------------------------------------------------
+def _run_combo_jst_first(args):
+    lr, reg, n_epochs, train, valid, features, uid2idx, sid2idx, verbose = args
+    best_ep, best_vmse, params, mse_hist = train_lfm_fixed_q_checkpoint(
+        train, valid, features, uid2idx, sid2idx,
+        lr=lr, reg=reg, n_epochs=n_epochs, verbose=verbose,
+    )
+    return lr, reg, best_ep, best_vmse, params, mse_hist
+
+
 def train_lfm_fixed_q_checkpoint(train, valid, features, uid2idx, sid2idx,
                                  lr=0.005, reg=0.02,
                                  beta1=0.9, beta2=0.999, eps=1e-8,
-                                 n_epochs=300):
+                                 n_epochs=300, verbose=False):
     """
     Train LFM with item factors fixed to `features`. Evaluates val MSE every
     epoch; keeps only the best epoch's params.
@@ -392,8 +392,9 @@ def train_lfm_fixed_q_checkpoint(train, valid, features, uid2idx, sid2idx,
 
         val_pred = mu + b_u[valid_users] + b_i[valid_items] \
                    + np.sum(P[valid_users] * features[valid_items], axis=1)
+        train_mse = float(np.mean(err ** 2))
         val_mse = float(np.mean((val_pred - valid_ratings) ** 2))
-        mse_history.append((epoch + 1, val_mse))
+        mse_history.append((epoch + 1, train_mse, val_mse))
 
         if epoch >= 200:
             if val_mse < _best_vmse:
@@ -413,6 +414,10 @@ def train_lfm_fixed_q_checkpoint(train, valid, features, uid2idx, sid2idx,
                 _loss_diff_counter = 0
 
         _prev_vmse = val_mse
+
+        if verbose and (epoch == 0 or (epoch + 1) % 100 == 0):
+            print(f"      [JSTFirst lr={lr} reg={reg}] epoch {epoch+1}/{n_epochs}  "
+                  f"train MSE {train_mse:.4f}  val MSE {val_mse:.4f}", flush=True)
 
     return _best_epoch, _best_vmse, _best_params, mse_history
 
@@ -477,7 +482,7 @@ def run_jst_first_tuned(train, valid, test, uid2idx, sid2idx,
                         lexicon_path='MPQA_Subjectivity_Lexicon.tff',
                         K=10, S=3, n_vocab=5000,
                         alpha=5.0, beta=0.01, gamma=(0.01, 5.0, 1.0),
-                        n_gibbs_iter=500, min_freq=20, seed=42):
+                        n_gibbs_iter=500, min_freq=20, seed=42, verbose=False):
     """
     1. Build corpus
     2. Load MPQA lexicon
@@ -518,36 +523,35 @@ def run_jst_first_tuned(train, valid, test, uid2idx, sid2idx,
     )
 
     # --- Stage 2: LFM grid search with per-epoch tracking ---
-    lr_grid  = [0.01, 0.02]
+    lr_grid  = [0.01]
     reg_grid = [0.001]
-    n_epochs = 1000
+    n_epochs = 5000
+
+    combos = [
+        (lr, reg, n_epochs, train, valid, features, uid2idx, sid2idx, verbose)
+        for lr in lr_grid for reg in reg_grid
+    ]
+    n_combos = len(combos)
 
     best_val_mse = np.inf
     best = None  # (lr, reg, n_ep, params)
     tuning_rows = []
     best_mse_history = None
 
-    print("Tuning JSTFirst...")
-    import time as _time
-    n_combos = len(lr_grid) * len(reg_grid)
+    print(f"Tuning JSTFirst ({n_combos} combos in parallel)...", flush=True)
     t_tune = _time.time()
-    combo_idx = 0
-    for lr in lr_grid:
-        for reg in reg_grid:
-            combo_idx += 1
-            best_ep, best_vmse, params, mse_hist = train_lfm_fixed_q_checkpoint(
-                train, valid, features, uid2idx, sid2idx,
-                lr=lr, reg=reg, n_epochs=n_epochs,
-            )
+    with ProcessPoolExecutor(max_workers=n_combos) as ex:
+        futures = {ex.submit(_run_combo_jst_first, c): c for c in combos}
+        for i, fut in enumerate(as_completed(futures), 1):
+            lr, reg, best_ep, best_vmse, params, mse_hist = fut.result()
             elapsed = _time.time() - t_tune
-            print(f"    [{combo_idx}/{n_combos}] lr={lr}, reg={reg}  "
-                  f"best val MSE in this combo: {best_vmse:.4f}  "
+            print(f"  [{i}/{n_combos}] lr={lr}, reg={reg}  "
+                  f"best val {best_vmse:.4f} @ epoch {best_ep}  "
                   f"(elapsed {elapsed:.1f}s)", flush=True)
-
-            for ep, vmse in mse_hist:
+            for ep, tmse, vmse in mse_hist:
                 tuning_rows.append({
                     'lr': lr, 'reg': reg, 'mu': float('nan'),
-                    'n_epochs': ep, 'val_mse': vmse,
+                    'n_epochs': ep, 'train_mse': tmse, 'val_mse': vmse,
                 })
             if best_vmse < best_val_mse:
                 best_val_mse = best_vmse

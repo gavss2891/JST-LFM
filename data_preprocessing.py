@@ -1,5 +1,5 @@
 """
-1_data_preprocessing.py
+data_preprocessing.py
 
 Loads the Amazon 5-core review data, cleans review text, splits into
 train/valid/test sets, and prepares documents for topic modelling.
@@ -17,6 +17,7 @@ import os
 
 import numpy as np
 import pandas as pd
+from gensim import corpora
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -48,43 +49,6 @@ def load_amazon_gz(path):
     df = df[['reviewerID', 'asin', 'overall', 'reviewText']].copy()
     return df
 
-def load_amazon_2023(path):
-    """
-    Read a 2023 Amazon Reviews JSONL file (gzipped or plain) and return
-    a DataFrame with columns ['reviewerID', 'asin', 'overall', 'reviewText']
-    matching the schema produced by load_amazon_gz for 2014 data.
-    """
-    opener = gzip.open if str(path).endswith('.gz') else open
- 
-    rows = []
-    with opener(path, 'rt', encoding='utf-8') as f:
-        for line in f:
-            obj = json.loads(line)
-            rows.append({
-                'reviewerID': obj['user_id'],
-                'asin':       obj['parent_asin'],   # product level
-                'overall':    float(obj['rating']),
-                'reviewText': obj.get('text') or '',
-            })
- 
-    return pd.DataFrame(rows)
- 
-def load_amazon(path):
-    """
-    Auto-detect 2014 vs 2023 format by filename suffix:
-      *.json.gz   → 2014 format (load_amazon_gz)
-      *.jsonl.gz  → 2023 format (load_amazon_2023)
-      *.jsonl     → 2023 format (plain text)
-    """
-    s = str(path)
-    if s.endswith('.jsonl') or s.endswith('.jsonl.gz'):
-        return load_amazon_2023(path)
-    if s.endswith('.json.gz'):
-        # delayed import to avoid circularity if you put this in a separate file
-        from data_preprocessing import load_amazon_gz
-        return load_amazon_gz(path)
-    raise ValueError(f"Unknown file format: {path}")
- 
 # ---------------------------------------------------------------------------
 # 2. Descriptive statistics
 # ---------------------------------------------------------------------------
@@ -242,16 +206,34 @@ def filter_k_core(data, k=5, verbose=True):
 # ---------------------------------------------------------------------------
 # 7. Dataset-level stats file
 # ---------------------------------------------------------------------------
-def save_dataset_stats(data, dataset_name, out_dir):
+def save_dataset_stats(data, dataset_name, out_dir, train=None, sid2idx=None, n_vocab=5000):
     """
     Save a one-row CSV with dataset-level statistics to
     <out_dir>/<dataset_name>_stats.csv.
+
+    If train and sid2idx are provided, n_tokens is computed the same way as
+    build_corpus: group train reviews by item, clean, filter to top n_vocab
+    words, count only surviving tokens. This matches the printed corpus count.
     """
     n_reviews = len(data)
     n_users   = data['reviewerID'].nunique()
     n_items   = data['asin'].nunique()
     density   = n_reviews / (n_users * n_items)
-    total_words = int(data['reviewText'].fillna('').str.split().str.len().sum())
+
+    if train is not None and sid2idx is not None:
+        t = train.copy()
+        if 'tokens' not in t.columns:
+            t['tokens'] = t['reviewText'].apply(clean)
+        docs = t.groupby('asin')['tokens'].apply(lambda x: sum(x, [])).reset_index()
+        docs.columns = ['asin', 'tokens']
+        dictionary = corpora.Dictionary(docs['tokens'])
+        dictionary.filter_extremes(keep_n=n_vocab)
+        vocab_set = set(dictionary.token2id)
+        n_tokens = int(docs['tokens'].apply(
+            lambda toks: sum(1 for w in toks if w in vocab_set)
+        ).sum())
+    else:
+        n_tokens = int(data['reviewText'].apply(clean).apply(len).sum())
 
     rating_counts = data['overall'].value_counts().sort_index()
     rating_str = ' | '.join(f'{int(r)}★:{int(c)}' for r, c in rating_counts.items())
@@ -261,7 +243,7 @@ def save_dataset_stats(data, dataset_name, out_dir):
         'n_users':            n_users,
         'n_items':            n_items,
         'density':            round(density, 6),
-        'total_words':        total_words,
+        'n_tokens':           n_tokens,
         'rating_distribution': rating_str,
     }
 
@@ -361,25 +343,3 @@ def plot_distributions(data, dataset_name, out_dir=None, bins=50):
         print(f"Saved distribution bins   → {hist_path}")
     else:
         plt.show()
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-if __name__ == '__main__':
-    import re
-    from pathlib import Path
-
-    DATA_DIR = Path(os.getenv('DATA_DIR', 'data'))
-    DATA_PATHS = [
-        DATA_DIR / 'reviews_Musical_Instruments_5.json.gz',
-        DATA_DIR / 'reviews_Amazon_Instant_Video_5.json.gz',
-        DATA_DIR / 'reviews_Digital_Music_5.json.gz',
-    ]
-
-    for path in DATA_PATHS:
-        name = re.sub(r'\.json\.gz$', '', re.sub(r'^reviews_', '', os.path.basename(path)))
-        print(f"\n=== {name} ===")
-        data = load_amazon(path)
-        print_stats(data)
-        plot_distributions(data, dataset_name=name, out_dir=os.path.join('results', name))
