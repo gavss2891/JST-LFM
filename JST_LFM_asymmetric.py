@@ -309,7 +309,7 @@ def top_words_per_topic_sentiment(psi_flat, Ks, offsets, dictionary, top_n=10):
 def fit_jst_lfm_asym(train, valid, all_words, all_docs, n_d, seen,
                      lexicon, uid2idx, sid2idx,
                      n_vocab, Ks=(9, 3, 3), k_star=0,
-                     alpha=5.0, beta=0.01, gamma=(0.1, 10, 1),
+                     alpha=5.0, beta=0.01, gamma=(0.1, 1, 10),
                      lr=0.005, reg=0.02, mu_corpus=1.0, kappa_init=1.0,
                      beta1=0.9, beta2=0.99, eps=1e-8,
                      n_epochs=300, seed=42, verbose=False):
@@ -552,7 +552,7 @@ def run_jst_lfm_asym_kstar(train, valid, test, uid2idx, sid2idx,
                            lr, reg, mu_corpus,
                            Ks=(9, 3, 3), k_star=0,
                            lexicon_path='MPQA_Subjectivity_Lexicon.tff',
-                           n_vocab=5000, alpha=5.0, beta=0.01, gamma=(0.1, 10, 1),
+                           n_vocab=5000, alpha=5.0, beta=0.01, gamma=(0.1, 1, 10),
                            min_freq=20, n_epochs=5000, seed=42,
                            corpus=None, lexicon=None, dictionary=None,
                            verbose=False):
@@ -633,7 +633,7 @@ def _run_combo_jst_lfm_asym(args):
 def run_jst_lfm_asym_tuned(train, valid, test, uid2idx, sid2idx,
                            lexicon_path='MPQA_Subjectivity_Lexicon.tff',
                            Ks=(9, 3, 3), n_vocab=5000,
-                           alpha=5.0, beta=0.01, gamma=(0.1, 10, 1),
+                           alpha=5.0, beta=0.01, gamma=(0.1, 1, 10),
                            min_freq=20, seed=42, verbose=False,
                            n_workers=None, mu_grid=None):
     """
